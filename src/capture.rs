@@ -246,12 +246,23 @@ pub(crate) fn run_compiler(
     fs::create_dir_all(root.join("invocations"))?;
     let stderr = format!("raw/{id}.stderr");
     let stdout = format!("raw/{id}.stdout");
+    let output = output_argument(&expanded).map(|p| path_string(resolve(&directory, p)));
     let mut actual = arguments;
     let mut trace = None;
+    let mut legacy_trace = None;
     let granularity_us = (info.family == "clang").then_some(if full { 0 } else { 500 });
     if info.family == "clang" {
         let path = format!("raw/{id}.trace.json");
-        actual.push(format!("-ftime-trace={}", root.join(&path).display()));
+        if info.explicit_trace_path {
+            actual.push(format!("-ftime-trace={}", root.join(&path).display()));
+        } else {
+            // Older Clang writes beside -o, including outputs expanded from response files.
+            let output = output
+                .as_deref()
+                .context("Clang tracing requires an -o output")?;
+            legacy_trace = Some(LegacyTrace::prepare(Path::new(output), &id)?);
+            actual.push("-ftime-trace".into());
+        }
         actual.push(format!(
             "-ftime-trace-granularity={}",
             granularity_us.unwrap()
@@ -271,7 +282,6 @@ pub(crate) fn run_compiler(
             actual.push("-fdiagnostics-format=sarif-stderr".into());
         }
     }
-    let output = output_argument(&expanded).map(|p| path_string(resolve(&directory, p)));
     let mut invocation = Invocation {
         id: id.clone(),
         directory: path_string(&directory),
@@ -301,6 +311,9 @@ pub(crate) fn run_compiler(
     )?;
     invocation.elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
     invocation.exit_code = Some(exit_code(status));
+    if let Some(mut sidecar) = legacy_trace {
+        sidecar.retain(&root.join(invocation.trace.as_ref().unwrap()))?;
+    }
     write_json(&manifest, &invocation)?;
     if let Ok(bytes) = fs::read(root.join(stdout)) {
         let _ = std::io::stdout().write_all(&bytes);
@@ -907,6 +920,79 @@ fn interrupted() -> &'static Arc<AtomicBool> {
         });
         flag
     })
+}
+
+/// Own the temporary sidecar location required by older Clang drivers. A previous
+/// file is moved aside before compilation so failed builds cannot reuse stale data.
+struct LegacyTrace {
+    /// Compiler-derived JSON path beside the original object or PCH output.
+    path: PathBuf,
+    /// Previous sidecar held in the same directory; None means no file existed.
+    backup: Option<PathBuf>,
+    /// Set after restoring the previous filesystem state, preventing repeated cleanup.
+    restored: bool,
+}
+
+impl LegacyTrace {
+    fn prepare(output: &Path, id: &str) -> Result<Self> {
+        let path = output.with_extension("json");
+        ensure!(
+            path != output,
+            "Clang trace would overwrite its compilation output"
+        );
+        let backup = match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.is_file() || metadata.is_symlink(),
+                    "Clang trace path is not a file"
+                );
+                let backup = path.with_extension(format!("json.buildscope-{id}.backup"));
+                fs::rename(&path, &backup).context("preserve existing Clang trace sidecar")?;
+                Some(backup)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Self {
+            path,
+            backup,
+            restored: false,
+        })
+    }
+
+    fn retain(&mut self, destination: &Path) -> Result<()> {
+        // Copy rather than rename: the store and build tree may use different filesystems.
+        match fs::copy(&self.path, destination) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("retain Clang trace sidecar"),
+        }
+        self.restore()
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+        if let Some(backup) = &self.backup {
+            fs::rename(backup, &self.path).context("restore previous Clang trace sidecar")?;
+        } else {
+            match fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Drop for LegacyTrace {
+    fn drop(&mut self) {
+        // Also restore a previous sidecar if spawning or collecting the compiler failed.
+        let _ = self.restore();
+    }
 }
 
 fn run_process(

@@ -136,9 +136,11 @@ and leaves its compiler detail in the spool for separate collection.
 | Preprocessed output size | Separate preprocessing probe | Separate preprocessing probe |
 | Rebuild causes and frequency | Recorded history | Recorded history |
 
-Clang uses -ftime-trace. Standard detail retains the default 500 microsecond
-threshold. Full detail uses a zero threshold and enables verbose metadata when
-the executable advertises it.
+Clang uses -ftime-trace. Drivers such as Clang 14 that cannot choose a trace
+filename use their output-derived JSON sidecar, which Buildscope retains in the
+capture while preserving any existing sidecar. Standard detail retains the default
+500 microsecond threshold. Full detail uses a zero threshold and enables verbose
+metadata when the executable advertises it.
 
 GCC uses -ftime-report and -ftime-report-details. If a capability probe confirms
 SARIF support, Buildscope reads the structured timing report from SARIF;

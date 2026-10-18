@@ -1,11 +1,13 @@
 //! Real command-line workflows against temporary CMake/Ninja projects. No tests
 //! edit the checked-in fixture, the editor application, or a user's build outputs.
 use buildscope::{
-    model::Capture,
+    compiler,
+    model::{Capture, Invocation},
     store::{EventQuery, Store},
 };
 use std::{
     fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     time::{Duration, Instant},
@@ -544,6 +546,125 @@ fn public_gcc_launcher_collects_native_timings_and_preserves_diagnostics() {
         !output.contains("\"$schema\""),
         "public launchers retain native diagnostic text"
     );
+}
+
+#[test]
+fn legacy_clang_traces_preserve_sidecars_and_never_reuse_stale_evidence() {
+    let Some(compiler) = clang() else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let wrapper = root.path().join("legacy clang++");
+    let compiler = shlex::try_quote(&compiler).unwrap();
+    // Exercise a real compiler while enforcing the older driver's trace-path contract.
+    fs::write(
+        &wrapper,
+        format!(
+            r#"#!/bin/sh
+if [ "$1" = "--help" ]; then
+    {compiler} --help | sed '/-ftime-trace=</d'
+    exit
+fi
+for argument in "$@"; do
+    case "$argument" in
+        -ftime-trace=*) echo 'explicit trace paths are unsupported' >&2; exit 1 ;;
+        -DBUILDSCOPE_FAIL) echo 'forced compiler failure' >&2; exit 37 ;;
+    esac
+done
+exec {compiler} "$@"
+"#
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!compiler::identify(wrapper.to_str().unwrap(), root.path()).explicit_trace_path);
+
+    for (name, previous, fail) in [
+        ("fresh", false, false),
+        ("existing", true, false),
+        ("failed existing", true, true),
+        ("failed fresh", false, true),
+    ] {
+        let build = root.path().join(name);
+        fs::create_dir(&build).unwrap();
+        fs::write(build.join("build.ninja"), "").unwrap();
+        fs::write(
+            build.join("source file.cpp"),
+            "int answer() { return 42; }\n",
+        )
+        .unwrap();
+        // Both the output path and source path are available only through a response file.
+        fs::write(
+            build.join("arguments.rsp"),
+            "-c 'source file.cpp' -o 'object file.o'\n",
+        )
+        .unwrap();
+        let sidecar = build.join("object file.json");
+        if previous {
+            fs::write(&sidecar, "previous user trace").unwrap();
+        }
+        let mut command = Command::new(env!("CARGO_BIN_EXE_buildscope"));
+        command
+            .current_dir(&build)
+            .args(["launch", "--detail", "full", "--build-dir"])
+            .arg(&build)
+            .arg("--")
+            .arg(&wrapper)
+            .arg("@arguments.rsp");
+        if fail {
+            command.arg("-DBUILDSCOPE_FAIL");
+        }
+        let result = command.output().unwrap();
+        assert_eq!(
+            result.status.code(),
+            Some(if fail { 37 } else { 0 }),
+            "{}",
+            diagnostics(&result)
+        );
+        if previous {
+            assert_eq!(fs::read_to_string(&sidecar).unwrap(), "previous user trace");
+        } else {
+            assert!(
+                !sidecar.exists(),
+                "new sidecars must be retained only in the spool"
+            );
+        }
+        assert!(!fs::read_dir(&build).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".backup")
+        }));
+        let pending = fs::read_dir(build.join(".buildscope-launcher/pending"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let manifest = fs::read_dir(pending.join("invocations"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let invocation: Invocation = serde_json::from_slice(&fs::read(manifest).unwrap()).unwrap();
+        assert_eq!(invocation.exit_code, result.status.code());
+        let trace = pending.join(invocation.trace.unwrap());
+        if fail {
+            assert!(
+                !trace.exists(),
+                "a failed compile must never retain a previous trace"
+            );
+        } else {
+            let (events, _) = compiler::read_clang_trace(&trace, &build).unwrap();
+            assert!(
+                !events.is_empty(),
+                "retain real compiler events from the sidecar"
+            );
+            assert!(build.join("object file.o").is_file());
+        }
+    }
 }
 
 #[test]

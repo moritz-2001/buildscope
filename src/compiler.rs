@@ -38,6 +38,7 @@ pub fn identify(executable: &str, directory: &Path) -> CompilerInfo {
         executable: executable.into(),
         version,
         family: family.into(),
+        explicit_trace_path: help.contains("-ftime-trace=<"),
         verbose_trace: help.contains("-ftime-trace-verbose"),
         sarif,
     }

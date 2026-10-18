@@ -134,6 +134,14 @@ keep launcher batches separate from ordinary builds and managed profiles.
 
 ## Compiler observations
 
+Compiler discovery checks whether Clang advertises an explicit time-trace path.
+Modern drivers write directly into each invocation's raw artifacts. Older drivers
+use `-ftime-trace`, then [capture.rs](src/capture.rs) copies the output-derived
+JSON sidecar into the same artifact layout. Response-file outputs are expanded
+before resolving that path. Any existing sidecar is moved aside and restored
+after compilation, including failures, so stale traces are never collected.
+This shared execution path serves managed profiles and the public launcher.
+
 Clang decoding handles complete X scopes, B/E scopes, and asynchronous b/e
 Source spans. Native Total events become metrics rather than duplicate trace
 scopes. Time containment is normalized independently within each process/thread

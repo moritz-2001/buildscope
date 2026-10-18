@@ -99,6 +99,9 @@ pub struct CompilerInfo {
     pub version: String,
     /// clang, gcc, or unknown.
     pub family: String,
+    /// Whether Clang advertises an explicit trace destination; false uses its output sidecar.
+    #[serde(default)]
+    pub explicit_trace_path: bool,
     /// Whether the executable advertises verbose trace metadata.
     pub verbose_trace: bool,
     /// Whether a probe successfully produced structured diagnostics.

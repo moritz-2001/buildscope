@@ -459,6 +459,16 @@ fn local_project_identities_do_not_merge_unrelated_projects() {
     );
 }
 
+#[test]
+fn older_compiler_manifests_use_legacy_trace_paths() {
+    let compiler: CompilerInfo = serde_json::from_value(json!({
+        "executable": "clang++", "version": "clang version 14.0.0",
+        "family": "clang", "verbose_trace": false, "sarif": false
+    }))
+    .unwrap();
+    assert!(!compiler.explicit_trace_path);
+}
+
 fn project_fixture(root: &Path) -> ProjectSnapshot {
     ProjectSnapshot {
         source_dir: path_string(root),
@@ -470,6 +480,7 @@ fn project_fixture(root: &Path) -> ProjectSnapshot {
             executable: "clang++".into(),
             version: "test clang".into(),
             family: "clang".into(),
+            explicit_trace_path: true,
             verbose_trace: true,
             sarif: false,
         }],
