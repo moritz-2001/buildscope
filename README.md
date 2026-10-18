@@ -148,7 +148,8 @@ because timer names and representations differ across compiler versions.
 The real-build tests exercise upstream Clang 20.1.8 and GCC 15.1.0 on the
 development machine. Older and vendor-specific formats are covered by decoder
 fixtures and capability detection, rather than an assumption of full parity.
-The CI workflow exercises Linux and macOS with the installed toolchains.
+The CI workflow exercises Linux and macOS; see [CI coverage](#ci-coverage) for
+the versioned compiler and Ninja combinations.
 
 ## Investigate one compilation unit
 
@@ -333,5 +334,22 @@ Compiler events and named detail are loaded on demand in the browser. Import
 still decodes one compilation unit at a time in memory; very large production
 projects and a wider compiler-version matrix need their own performance and
 compatibility measurements.
+
+### CI coverage
+
+The real-build compatibility suite runs each Linux toolchain below with
+**Ninja 1.11.1, 1.12.1, and 1.13.2**, covering nine combinations:
+
+| Runner | Clang | GCC |
+| --- | --- | --- |
+| Ubuntu 22.04 | 14 | 11 |
+| Ubuntu 24.04 | 18 | 13 |
+| Ubuntu 24.04 | 20 | 14 |
+
+Jobs select both compiler executables explicitly and verify their major versions
+and the exact Ninja version before testing. Ninja releases are checksum verified.
+The Linux and macOS verification jobs also run formatting, Clippy, the full Rust
+suite, JavaScript checks, UI-tour tests, and a release build with their installed
+toolchains.
 
 See [architecture](ARCHITECTURE.md) for interfaces and invariants.
