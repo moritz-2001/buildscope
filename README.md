@@ -8,6 +8,11 @@ Record ordinary builds to understand elapsed time, dependencies, and rebuild
 history. Use a separate compiler profile to investigate expensive headers,
 templates, compile-time evaluation, and code generation.
 
+![Buildscope overview showing build metrics and a timeline of concurrent compilation and linking](docs/screenshots/overview.jpg)
+
+*See elapsed time, accumulated work, and concurrent actions at a glance.*
+Screenshots use the guided tour's synthetic example data.
+
 ## Quick start
 
 Requirements: a current Rust toolchain, CMake, Ninja, and a C++ compiler on PATH.
@@ -164,8 +169,14 @@ Preprocessed bytes/lines describe input volume; they are not token counts or
 proof of parsing complexity.
 
 The unit report has summary, templates, functions, constant evaluation, includes,
-trace events, and original-command views. Events can be searched, filtered by
-activity, ordered by duration or time, and paged through the SQLite index.
+trace events, and original-command views.
+
+![Compiler investigation showing template spellings, inclusive work, event counts, and source links](docs/screenshots/compiler-details.jpg)
+
+*Inspect template instantiations and follow compiler-supplied source locations.*
+
+Events can be searched, filtered by activity, ordered by duration or time, and
+paged through the SQLite index.
 Selecting a scope opens its immediate recorded children and containing scope.
 
 Approximate template-family grouping is a display operation. Exact compiler
@@ -181,6 +192,10 @@ template-instantiation dependency graph.
 The header view separates distinct source files from compilation units. It
 shows direct recorded inclusion, dependent units, measured processing work,
 rebuilt units, and associated compilation work.
+
+![Header investigation showing dependent units, processing costs, and recorded include chains](docs/screenshots/header-analysis.jpg)
+
+*Follow include chains to understand how a costly header reaches compilation units.*
 
 Historical trigger counts use captures with the same configuration and requested
 target set. Ordinary recordings and instrumented profiles remain separate.
