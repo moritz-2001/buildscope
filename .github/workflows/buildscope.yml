@@ -1,0 +1,38 @@
+name: Buildscope
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Linux build tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build clang g++
+      - name: macOS build tools
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake ninja llvm gcc
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          for compiler in "$(brew --prefix gcc)"/bin/g++-*; do
+            if [ -x "$compiler" ]; then
+              echo "BUILDSCOPE_TEST_GCC=$compiler" >> "$GITHUB_ENV"
+              break
+            fi
+          done
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked -- --nocapture
+      - run: node --check src/web/app.js
+      - run: node --check src/web/tour.js
+      - run: node --test tests/tour.test.cjs
+      - run: cargo build --release --locked

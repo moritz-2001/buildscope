@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Buildscope · C++ build investigation</title>
+  <link rel="stylesheet" href="/style.css">
+  <script defer src="/tour.js"></script>
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <aside>
+    <a class="brand" href="#overview"><span class="mark">B</span> buildscope</a>
+    <p class="eyebrow">C++ BUILD INVESTIGATION</p>
+    <label for="run">Capture</label><select id="run"></select>
+    <nav aria-label="Report views">
+      <button data-view="overview" class="active">Overview</button>
+      <button data-view="headers">Headers <span id="header-count"></span></button>
+      <button data-view="units">Compilation units</button>
+      <button data-view="history">Build history</button>
+      <button data-view="compare">Compare captures</button>
+    </nav>
+    <button id="start-tour" class="action tour-launch">Guided tour · example data</button>
+    <div class="aside-bottom"><span class="live-dot"></span> Local capture · retained evidence</div>
+  </aside>
+  <main>
+    <header><div><p class="eyebrow" id="breadcrumb">BUILD OVERVIEW</p><h1 id="title">Loading capture…</h1></div><span id="status" class="badge"></span></header>
+    <div id="context"></div>
+    <section id="content" aria-live="polite"></section>
+  </main>
+  <dialog id="detail"><button id="close-detail" class="close" aria-label="Close details">×</button><div id="detail-body"></div></dialog>
+  <div id="toast" role="status"></div>
+  <section id="tour-panel" aria-labelledby="tour-title" hidden>
+    <div class="tour-heading"><span class="pill">EXAMPLE DATA</span><span id="tour-progress" class="muted small"></span><button id="exit-tour" class="tour-exit" aria-label="Exit guided tour">×</button></div>
+    <h2 id="tour-title"></h2>
+    <div class="tour-copy"><p id="tour-description"></p><p id="tour-hint" class="small muted"></p></div>
+    <div class="tour-controls"><button id="tour-back" class="action">← Back</button><button id="tour-next" class="action">Next →</button></div>
+    <span id="tour-announcement" class="sr-only" role="status" aria-live="polite"></span>
+  </section>
+</body>
+</html>

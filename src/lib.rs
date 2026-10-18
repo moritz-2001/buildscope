@@ -1,0 +1,14 @@
+//! C++ build capture and evidence-based analysis. Start with `capture::record` or
+//! `capture::profile`, or use `launcher::launch` and `launcher::collect` during normal
+//! builds. All collectors produce the same versioned model for storage and reports.
+
+pub mod analysis;
+pub mod capture;
+pub mod cli;
+pub mod compiler;
+pub mod launcher;
+pub mod model;
+pub mod project;
+pub mod report;
+pub mod store;
+pub mod util;
