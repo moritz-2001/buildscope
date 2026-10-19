@@ -156,7 +156,7 @@ function render() {
   $("#breadcrumb").textContent=state.view==="units"?"COMPILATION UNITS":state.view.toUpperCase();
   $("#status").textContent=(BuildscopeTour.active?"Example data · ":"")+run.status+" · "+run.kind; $("#status").className="badge "+run.status;
   $("#header-count").textContent=num(run.headers.length);
-  $("#context").textContent=(run.label?run.label+" · ":"")+date(run.started_ms)+" · "+run.project.build_type+" · "+run.project.build_dir;
+  $("#context").textContent=(run.label?run.label+" · ":"")+date(run.started_ms)+" · "+run.project.build_type+" · "+gitLabel(run.git)+" · "+run.project.build_dir;
   document.querySelectorAll("nav button").forEach(b=>{b.disabled=false;b.classList.toggle("active",b.dataset.view===state.view);});
   $("#run").disabled=false;
   let html="";
@@ -173,6 +173,7 @@ function render() {
       '<div><div class="panel"><h2>Capture coverage</h2><p>' + run.project.compilers.map(c=>pill(c.family)+" "+esc(c.version.split("\n")[0])).join("</p><p>") +
       '</p><p class="small muted">Dependency records: '+num(run.summary.dependency_units)+" / "+num(run.project.units.length)+" units.</p>" +
       '<p class="small muted">Compiler detail: '+num(run.profiles.length)+' invocations. Cache policy: '+esc(run.cache_policy)+'.</p>' +
+      '<p class="small">Git: '+gitDetails(run.git)+'</p>'+notes(["available","mixed"].includes(run.git?.status)?["Git state was observed before execution. Uncommitted changes and edits during compilation mean HEAD alone does not identify the compiled contents."]:[])+
       notes(run.notes)+'</div><div class="panel"><h2>Start an investigation</h2><p class="muted small">Follow a costly header into its dependent units, then inspect compiler activity and retained evidence.</p>' +
       '<button class="action" data-action="view" data-id="headers">Explore headers →</button></div></div></div>';
   } else if(state.view==="headers") {
@@ -188,6 +189,7 @@ function render() {
       table([
         {label:"Capture",render:r=>'<span class="path">'+esc(r.id)+'</span><div class="muted small">'+esc(r.label||"")+'</div>'},
         {label:"When",render:r=>esc(date(r.started_ms))},{label:"Mode",render:r=>pill(r.kind)},
+        {label:"Git",render:r=>gitDetails(r.git)},
         {label:"Status",render:r=>esc(r.status)},{label:"Observed duration",numeric:true,render:r=>time(r.elapsed_ms)},
         {label:"Actions",numeric:true,render:r=>num(r.actions)}
       ],state.runs,{action:"run",id:r=>r.id});
@@ -219,8 +221,23 @@ function render() {
     showComparison().catch(e=>toast(e.message));
   }
 }
+function gitLabel(git) {
+  let label;
+  switch(git?.status) {
+    case "available": label=(git.branch??"Detached HEAD")+" · "+(git.commit?.slice(0,12)??"no commits yet");break;
+    case "mixed": label="Multiple Git revisions or unavailable observations";break;
+    case "not_repository": label="No Git repository";break;
+    case "unavailable": label="Git information unavailable";break;
+    default: label="Git information not recorded";
+  }
+  return label+(git?.dirty===true?" · uncommitted changes":"");
+}
+function gitDetails(git) {
+  return '<span title="'+esc(git?.commit??gitLabel(git))+'">'+esc(gitLabel(git))+'</span>'+
+    (git?.commit?' <button class="action small" data-action="copy-commit" data-id="'+esc(git.commit)+'">Copy commit</button>':"");
+}
 function runOptions(selected) {
-  return state.runs.map(r=>'<option value="'+esc(r.id)+'"'+(r.id===selected?" selected":"")+'>'+esc((r.label||r.id.slice(-14))+" · "+r.kind+" · "+date(r.started_ms))+'</option>').join("");
+  return state.runs.map(r=>'<option value="'+esc(r.id)+'"'+(r.id===selected?" selected":"")+'>'+esc((r.label||r.id.slice(-14))+" · "+r.kind+" · "+gitLabel(r.git)+" · "+date(r.started_ms))+'</option>').join("");
 }
 function bindFilters() {
   const input=$("#filter");
@@ -434,8 +451,8 @@ async function showComparison() {
   if($("#comparison-mode")?.value==="series") {
     if(!before||!after){$("#comparison").innerHTML=notes(["Record successful captures with before/after experiment labels to compare repeated measurements."]);return;}
     const result=await api("/api/compare-series",{before_label:before,after_label:after});
-    $("#comparison").innerHTML='<div class="metrics">'+metric("Before median",time(result.before.median_ms),num(result.before.count)+" successful samples")+
-      metric("After median",time(result.after.median_ms),num(result.after.count)+" successful samples")+
+    $("#comparison").innerHTML='<div class="metrics">'+metric("Before median",time(result.before.median_ms),num(result.before.count)+" successful samples · "+gitLabel(result.before.git))+
+      metric("After median",time(result.after.median_ms),num(result.after.count)+" successful samples · "+gitLabel(result.after.git))+
       metric("Observed median difference",signed(result.delta_median_ms),"Observed duration; launcher batches exclude whole-build work")+
       metric("Recorded conditions",result.conditions_match?"Match":"Differ","Check configuration and cache conditions")+'</div>'+
       notes(result.limitations)+table([{label:"Label",render:r=>esc(r.label)},{label:"Samples",numeric:true,render:r=>num(r.count)},
@@ -446,8 +463,8 @@ async function showComparison() {
   }
   const result=await api("/api/compare",{before,after});
   if(!$("#comparison"))return;
-  $("#comparison").innerHTML='<div class="metrics">'+metric("Before",time(result.before_elapsed_ms),result.before_timing_scope)+
-    metric("After",time(result.after_elapsed_ms),result.after_timing_scope)+metric("Observed difference",signed(result.delta_elapsed_ms),"Repeat to establish a stable improvement")+
+  $("#comparison").innerHTML='<div class="metrics">'+metric("Before",time(result.before_elapsed_ms),result.before_timing_scope+" · "+gitLabel(result.before_git))+
+    metric("After",time(result.after_elapsed_ms),result.after_timing_scope+" · "+gitLabel(result.after_git))+metric("Observed difference",signed(result.delta_elapsed_ms),"Repeat to establish a stable improvement")+
     metric("Conditions",result.conditions_match?"Match":"Differ","Recorded configuration and capture settings")+'</div>'+
     notes([...result.differences,...result.limitations])+'<h2>Matched compilation actions</h2>'+
     table([{label:"Source",render:u=>'<span class="path">'+esc(u.source)+'</span>'},
@@ -514,6 +531,7 @@ document.addEventListener("click",async event=>{
     else if(action==="unit-tab")await openUnit(id,button.dataset.tab);
     else if(action==="scope")await openScope(Number(id));
     else if(action==="source")await showSource(button.dataset.path,button.dataset.line);
+    else if(action==="copy-commit"){await navigator.clipboard.writeText(id);toast("Commit ID copied.");}
     else if(action==="copy-profile"){await navigator.clipboard.writeText(investigationCommand(unitById.get(id)));toast("Investigation command copied.");}
     else if(action==="run"){await loadRun(id);}
     else if(action==="view"){state.view=id;render();}

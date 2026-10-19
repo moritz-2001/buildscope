@@ -755,6 +755,7 @@ fn capture_fixture(root: &Path) -> Capture {
         status: "success".into(),
         kind: "record".into(),
         label: None,
+        git: Default::default(),
         machine: "test-host".into(),
         environment: BTreeMap::new(),
         cache_policy: "preserved".into(),
@@ -770,4 +771,23 @@ fn capture_fixture(root: &Path) -> Capture {
         notes: vec![],
         summary: BuildSummary::default(),
     }
+}
+
+#[test]
+fn old_capture_metadata_defaults_to_not_recorded() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut manifest = serde_json::to_value(capture_fixture(temp.path())).unwrap();
+    manifest.as_object_mut().unwrap().remove("git");
+    let capture: Capture = serde_json::from_value(manifest).unwrap();
+    assert_eq!(capture.git.status, buildscope::git::GitStatus::NotRecorded);
+    let store = Store::open(&temp.path().join("store")).unwrap();
+    store.save(&capture).unwrap();
+    let archive = temp.path().join("old.buildscope");
+    store.export(&capture.id, &archive, false).unwrap();
+    let imported = Store::open(&temp.path().join("imported")).unwrap();
+    imported.import(&archive).unwrap();
+    assert_eq!(
+        imported.load(&capture.id).unwrap().git.status,
+        buildscope::git::GitStatus::NotRecorded
+    );
 }

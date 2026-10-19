@@ -494,6 +494,7 @@ fn execute(
         status: "running".into(),
         kind: kind.into(),
         label: request.label.clone(),
+        git: crate::git::observe(Path::new(&project.source_dir)),
         machine: machine_identity(),
         environment: compiler_environment(),
         cache_policy: if instrumented {

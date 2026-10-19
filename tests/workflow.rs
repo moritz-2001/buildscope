@@ -368,6 +368,229 @@ fn cancellation_retains_a_finalized_partial_capture() {
 }
 
 #[test]
+fn managed_captures_save_git_state_without_changing_configuration_identity() {
+    let Some(compiler) = clang() else {
+        return;
+    };
+    let fixture = Fixture::new(&compiler, &[]);
+    git_command(&fixture.source, &["init", "--initial-branch=main"]);
+    git_command(&fixture.source, &["add", "."]);
+    git_command(&fixture.source, &["commit", "-m", "initial"]);
+    let commit = git_command(&fixture.source, &["rev-parse", "HEAD"]);
+    let result = fixture.run(&["record"]);
+    assert!(result.status.success(), "{}", diagnostics(&result));
+    let recorded = fixture.latest();
+    assert_eq!(recorded.git.branch.as_deref(), Some("main"));
+    assert_eq!(recorded.git.commit.as_deref(), Some(commit.as_str()));
+    assert_eq!(recorded.git.dirty, Some(false));
+    assert!(recorded.git.observed_ms.unwrap() <= recorded.finished_ms.unwrap());
+
+    let result = fixture.run(&["profile"]);
+    assert!(result.status.success(), "{}", diagnostics(&result));
+    assert_eq!(fixture.latest().git.commit, recorded.git.commit);
+    assert_eq!(fixture.latest().git.dirty, Some(false));
+    git_command(&fixture.source, &["checkout", "-b", "feature/new-revision"]);
+    git_command(
+        &fixture.source,
+        &["commit", "--allow-empty", "-m", "next revision"],
+    );
+    fs::write(fixture.source.join("untracked.cpp"), "// local work\n").unwrap();
+    let result = fixture.run(&["record"]);
+    assert!(result.status.success(), "{}", diagnostics(&result));
+    let after = fixture.latest();
+    assert_eq!(after.git.branch.as_deref(), Some("feature/new-revision"));
+    assert_ne!(after.git.commit, recorded.git.commit);
+    assert_eq!(after.git.dirty, Some(true));
+    assert_eq!(
+        after.project.configuration_id,
+        recorded.project.configuration_id
+    );
+    let comparison = buildscope::analysis::compare(&recorded, &after);
+    assert_eq!(comparison["conditions_match"], true);
+    assert_eq!(comparison["before_git"]["commit"], commit);
+    assert_eq!(comparison["after_git"]["dirty"], true);
+    assert_eq!(
+        fixture.store().overview(&after.id).unwrap()["git"]["dirty"],
+        true
+    );
+    assert!(
+        fixture
+            .store()
+            .list()
+            .unwrap()
+            .iter()
+            .any(|run| run["id"] == after.id && run["git"]["dirty"] == true)
+    );
+
+    for args in [
+        vec!["inspect", "latest"],
+        vec!["list"],
+        vec!["compare", &recorded.id, &after.id],
+    ] {
+        let result = Command::new(env!("CARGO_BIN_EXE_buildscope"))
+            .arg("--store")
+            .arg(&fixture.store_path)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{}", diagnostics(&result));
+        assert!(String::from_utf8_lossy(&result.stdout).contains("feature/new-revision"));
+    }
+}
+
+#[test]
+fn launcher_retains_precompile_revisions_across_delayed_mixed_and_legacy_collection() {
+    use buildscope::git::GitStatus;
+    let Some(compiler) = clang() else {
+        return;
+    };
+    let fixture = Fixture::new(&compiler, &[]);
+    git_command(&fixture.source, &["init", "--initial-branch=main"]);
+    git_command(&fixture.source, &["add", "."]);
+    git_command(&fixture.source, &["commit", "-m", "initial"]);
+    let first_commit = git_command(&fixture.source, &["rev-parse", "HEAD"]);
+    let launcher = format!(
+        "{};launch;--build-dir;{};--",
+        env!("CARGO_BIN_EXE_buildscope"),
+        fixture.build.display()
+    );
+    fixture.configure(
+        &compiler,
+        &[&format!("-DCMAKE_CXX_COMPILER_LAUNCHER={launcher}")],
+    );
+    assert!(normal_build(&fixture).status.success());
+    git_command(&fixture.source, &["checkout", "-b", "feature/second"]);
+    let first_source = fs::read_to_string(fixture.source.join("first.cpp")).unwrap();
+    fs::write(
+        fixture.source.join("first.cpp"),
+        format!("{first_source}\n// second revision\n"),
+    )
+    .unwrap();
+    git_command(&fixture.source, &["add", "first.cpp"]);
+    git_command(&fixture.source, &["commit", "-m", "second"]);
+    let second_commit = git_command(&fixture.source, &["rev-parse", "HEAD"]);
+
+    // Collection happens on the new branch, while all compiled observations came from main.
+    let result = collect_launcher(&fixture, "delayed");
+    assert!(result.status.success(), "{}", diagnostics(&result));
+    let delayed = fixture.latest();
+    assert_eq!(delayed.git.branch.as_deref(), Some("main"));
+    assert_eq!(delayed.git.commit.as_deref(), Some(first_commit.as_str()));
+    assert_eq!(delayed.git.dirty, Some(false));
+    assert!(normal_build(&fixture).status.success());
+    git_command(&fixture.source, &["checkout", "main"]);
+    assert!(normal_build(&fixture).status.success());
+    let result = collect_launcher(&fixture, "mixed");
+    assert!(result.status.success(), "{}", diagnostics(&result));
+    let mixed = fixture.latest();
+    assert_eq!(mixed.git.status, GitStatus::Mixed);
+    assert_eq!(mixed.git.commit, None);
+    assert_eq!(mixed.git.dirty, Some(false));
+    assert!(
+        mixed
+            .notes
+            .iter()
+            .any(|note| note.contains("Git state differs"))
+    );
+    let store = fixture.store();
+    let observations = store.run_dir(&mixed.id).unwrap().join("observations");
+    let commits = fs::read_dir(&observations)
+        .unwrap()
+        .map(|entry| {
+            let observation: serde_json::Value =
+                serde_json::from_slice(&fs::read(entry.unwrap().path()).unwrap()).unwrap();
+            assert_eq!(observation["git"]["dirty"], false);
+            observation["git"]["commit"].as_str().unwrap().to_owned()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(commits, [first_commit, second_commit].into_iter().collect());
+    let archive = fixture.root.path().join("git.buildscope");
+    store.export(&mixed.id, &archive, false).unwrap();
+    let imported = Store::open(&fixture.root.path().join("imported")).unwrap();
+    imported.import(&archive).unwrap();
+    assert_eq!(imported.load(&mixed.id).unwrap().git, mixed.git);
+    let imported_observations = imported.run_dir(&mixed.id).unwrap().join("observations");
+    assert_eq!(
+        fs::read_dir(&imported_observations).unwrap().count(),
+        fs::read_dir(&observations).unwrap().count()
+    );
+    for entry in fs::read_dir(&observations).unwrap() {
+        let entry = entry.unwrap();
+        assert_eq!(
+            fs::read(entry.path()).unwrap(),
+            fs::read(imported_observations.join(entry.file_name())).unwrap()
+        );
+    }
+
+    // Old pending observations remain unknown, even when collection can see a current checkout.
+    fs::write(
+        fixture.source.join("first.cpp"),
+        format!("{first_source}\n// legacy observation\n"),
+    )
+    .unwrap();
+    assert!(normal_build(&fixture).status.success());
+    for entry in fs::read_dir(fixture.build.join(".buildscope-launcher/pending")).unwrap() {
+        let path = entry.unwrap().path().join("observation.json");
+        let mut observation: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        observation.as_object_mut().unwrap().remove("git");
+        fs::write(path, serde_json::to_vec(&observation).unwrap()).unwrap();
+    }
+    assert!(collect_launcher(&fixture, "legacy").status.success());
+    assert_eq!(fixture.latest().git.status, GitStatus::NotRecorded);
+}
+
+#[test]
+fn missing_git_does_not_prevent_launcher_compilation() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("build.ninja"), "").unwrap();
+    fs::write(
+        root.path().join("CMakeCache.txt"),
+        format!("CMAKE_HOME_DIRECTORY:INTERNAL={}\n", root.path().display()),
+    )
+    .unwrap();
+    fs::write(root.path().join("source.cpp"), "").unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_buildscope"))
+        .current_dir(root.path())
+        .env("PATH", "/nonexistent-buildscope-test-path")
+        .args(["launch", "--build-dir"])
+        .arg(root.path())
+        .args(["--", "/usr/bin/true", "-c", "source.cpp", "-o", "object.o"])
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", diagnostics(&result));
+    let pending = fs::read_dir(root.path().join(".buildscope-launcher/pending"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let observation: serde_json::Value =
+        serde_json::from_slice(&fs::read(pending.join("observation.json")).unwrap()).unwrap();
+    assert_eq!(observation["git"]["status"], "unavailable");
+    assert_eq!(observation["invocation"]["exit_code"], 0);
+}
+
+fn git_command(root: &Path, args: &[&str]) -> String {
+    let result = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "-c",
+            "user.name=Buildscope Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", diagnostics(&result));
+    String::from_utf8(result.stdout).unwrap().trim().to_owned()
+}
+
+#[test]
 fn public_cmake_launcher_collects_parallel_incremental_and_failed_invocations() {
     let Some(compiler) = clang() else {
         return;

@@ -52,6 +52,48 @@ Absolute filenames retain source navigation context. Portable keys distinguish
 source-relative, generated, and external files. External SDK paths are not
 silently merged across toolchains.
 
+## Git provenance
+
+[git.rs](src/git.rs) owns the `GitSnapshot` model, best-effort local observation,
+formatting, and pure batch summarization. `Capture.git` defaults to `NotRecorded`
+for existing schema-1 captures; the schema and SQLite layout remain unchanged.
+Available snapshots retain observation time, local branch, full HEAD object ID,
+and repository-wide dirtiness. Detached HEAD has no branch; an unborn branch has
+no commit. Explicit statuses distinguish non-repositories, discovery failures,
+missing historical metadata, and mixed batches. No remote URLs or credentials
+are added to the capture.
+
+Managed [capture::execute](src/capture.rs) observes `ProjectSnapshot.source_dir`
+before persisting the running capture and spawning Ninja. The public
+[launcher](src/launcher.rs) reads `CMAKE_HOME_DIRECTORY` directly from CMake's
+cache and observes that source checkout before `run_compiler`, without full Ninja
+discovery or SQLite access. Missing cache context yields unavailable provenance;
+generated source locations and the launcher's working directory are not used as
+repository fallbacks.
+
+Each completed launcher observation retains its snapshot. Collection summarizes
+only these saved values, ignoring timestamps for branch/commit agreement and
+combining dirty state conservatively: any true is true, all false is false,
+otherwise unknown. Branch, commit, or discovery-outcome disagreement produces a
+mixed summary with no single branch/commit. Individual snapshots survive in the
+retained `observations/*.json` files and archives. Old spool entries default to
+not recorded and are never backfilled from the current checkout.
+
+Observation uses Git's porcelain-v2 NUL-delimited status with branch headers,
+explicit untracked/submodule handling, and optional locks disabled. Explicit
+Git directory/worktree/index environment overrides are removed so the query uses
+the configured source directory. Filenames are handled as bytes; rename source
+paths cannot be mistaken for branch headers. Discovery is outside measured build
+and compiler time, though per-invocation scans add launcher overhead. An observation
+does not guarantee the working tree remained unchanged during execution.
+
+[store.rs](src/store.rs) includes Git summaries in history and report data.
+[analysis.rs](src/analysis.rs) includes both revisions in comparisons and summarizes
+series provenance without changing configuration identity or compatibility.
+The CLI and embedded report render saved metadata, including unknown states;
+report commit buttons copy the full object ID. Reports and imports do not refresh
+revision metadata from the current checkout.
+
 ## Recording lifecycle
 
 1. Discover the configured project and preceding compatible capture.

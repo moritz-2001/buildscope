@@ -34,6 +34,31 @@ The default capture store is .buildscope in the current directory. Pass
 --store /path/to/captures, or set BUILDSCOPE_STORE, to use another location.
 Run IDs accept unique prefixes; latest selects the newest capture.
 
+Captures save the local Git branch, full HEAD commit ID, and working-tree dirty
+state from the configured CMake source directory before compilation. The report,
+`list`, `inspect`, and comparisons show the saved revision; `inspect --json`
+includes the full metadata. The report can copy the full commit ID. Detached HEAD,
+branches without commits, non-Git projects, unavailable Git, and older captures
+without metadata have explicit states. Git discovery failures do not fail a build.
+
+Public compiler launchers save Git state before each compiler invocation. `collect`
+uses those saved observations even if you have since switched branches. Batches
+with differing branches, commits, or discovery outcomes show a mixed Git state;
+individual snapshots remain in `observations/*.json` inside the capture and its
+exported archive. Any dirty observation flags uncommitted changes; a batch is
+clean only when every observation was known to be clean. Older launcher spool
+entries remain “not recorded.”
+
+Dirty state includes staged, unstaged, conflicted, and untracked files across the
+containing repository, respecting ignore rules, including submodule changes.
+Ignore build outputs and Buildscope's stores/spools in Git to avoid counting them
+as untracked work. Git status scans run outside measured compiler/build duration;
+launcher mode performs a scan per invocation, which can add overhead in large
+repositories. HEAD and a dirty flag are provenance, not an exact source snapshot:
+source edits during compilation are still possible. Git metadata remains separate
+from project/configuration identity, and export/import preserves recorded values.
+
+
 Buildscope is a standalone repository. Run these commands from its root directory.
 
 ## Guided UI tour

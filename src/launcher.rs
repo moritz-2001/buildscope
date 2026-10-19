@@ -57,6 +57,19 @@ pub fn launch(request: &LauncherRequest) -> Result<i32> {
     let id = unique_id();
     let root = spool.join("pending").join(&id);
     fs::create_dir(&root)?;
+    // Read only the CMake cache here: full project discovery invokes Ninja and must
+    // remain in collect, outside concurrent compiler processes. Generated sources
+    // can live outside the repository, so their filenames cannot identify its root.
+    let git = project::read_cache(&build.join("CMakeCache.txt"))
+        .ok()
+        .and_then(|cache| cache.get("CMAKE_HOME_DIRECTORY").cloned())
+        .filter(|source| !source.is_empty())
+        .map(|source| crate::git::observe(&resolve(&build, source)))
+        .unwrap_or_else(|| crate::git::GitSnapshot {
+            status: crate::git::GitStatus::Unavailable,
+            observed_ms: Some(now_ms()),
+            ..Default::default()
+        });
     let invocation = capture::run_compiler(
         request.arguments.clone(),
         &root,
@@ -79,6 +92,7 @@ pub fn launch(request: &LauncherRequest) -> Result<i32> {
         schema_version: SCHEMA_VERSION,
         id,
         build_dir: path_string(&build),
+        git,
         compiler: info,
         arguments,
         source,
@@ -163,6 +177,7 @@ pub fn collect(store: &Store, build_dir: &Path, label: Option<String>) -> Result
         id: format!("launcher-{}", &digest(serde_json::to_vec(&ids)?)[..32]),
         started_ms: started, finished_ms: None, elapsed_ms: 0.0, status: "running".into(), kind: "launcher".into(),
         label, machine: first.machine.clone(), environment: first.environment.clone(),
+        git: crate::git::summarize(observations.iter().map(|(_, observation)| &observation.git)),
         cache_policy: "preserved; individual outcomes unknown".into(), profile_origin: None, targets: Vec::new(),
         project: inventory.clone(), actions: Vec::new(), profiles: Vec::new(), headers: Vec::new(),
         inputs: BTreeMap::new(), changes: Vec::new(), findings: Vec::new(), summary: BuildSummary::default(),
@@ -174,6 +189,9 @@ pub fn collect(store: &Store, build_dir: &Path, label: Option<String>) -> Result
             "Dependency inventory is read at collection time and can contain older records. Source fingerprints were taken after each compiler invocation, not at collection time.".into(),
         ],
     };
+    if run.git.status == crate::git::GitStatus::Mixed {
+        run.notes.push("Git state differs between launcher invocations. Per-invocation snapshots are retained in observations/*.json; collection does not query the current checkout for revision metadata.".into());
+    }
     if incomplete > 0 {
         run.notes.push(format!(
             "{incomplete} unfinished invocations remain in the spool; this batch excludes them."
@@ -346,6 +364,9 @@ struct Observation {
     schema_version: u32,
     id: String,
     build_dir: String,
+    // Saved before compilation; absent in spool data produced by older versions.
+    #[serde(default)]
+    git: crate::git::GitSnapshot,
     compiler: CompilerInfo,
     arguments: Vec<String>,
     source: Option<String>,

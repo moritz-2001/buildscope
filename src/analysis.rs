@@ -176,7 +176,8 @@ pub fn compare(before: &Capture, after: &Capture) -> Value {
             "before_rebuilt_units":old.rebuilt_units,"after_rebuilt_units":header.rebuilt_units}))
     }).collect();
     json!({"before_timing_scope":timing_scope(before),"after_timing_scope":timing_scope(after),
-        "before":before.id,"after":after.id,"conditions_match":differences.is_empty(),
+        "before":before.id,"after":after.id,"before_git":before.git,"after_git":after.git,
+        "conditions_match":differences.is_empty(),
         "differences":differences,"limitations":["Single-run differences are observations, not proof of repeatable savings.",
         "Ordinary recordings preserve compiler caches; individual cache hit outcomes are unknown.",
         "Only units executed in both captures have paired action timings.",
@@ -224,6 +225,7 @@ pub fn compare_series(before: &[Capture], after: &[Capture]) -> anyhow::Result<V
             values[lower] + (values[upper] - values[lower]) * (location - lower as f64)
         };
         json!({"label":runs[0].label,"run_ids":runs.iter().map(|r|&r.id).collect::<Vec<_>>(),
+            "git":crate::git::summarize(runs.iter().map(|run| &run.git)),
             "count":values.len(),"median_ms":percentile(0.5),"p10_ms":percentile(0.1),
             "p90_ms":percentile(0.9),"min_ms":values[0],"max_ms":values[values.len()-1]})
     };

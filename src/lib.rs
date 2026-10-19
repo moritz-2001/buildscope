@@ -6,6 +6,7 @@ pub mod analysis;
 pub mod capture;
 pub mod cli;
 pub mod compiler;
+pub mod git;
 pub mod launcher;
 pub mod model;
 pub mod project;

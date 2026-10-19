@@ -25,6 +25,10 @@ pub struct Capture {
     pub kind: String,
     /// User scenario or experiment name; None means unnamed.
     pub label: Option<String>,
+    /// Source checkout observed before execution; launcher batches summarize their
+    /// retained per-invocation observations. Missing historical data is NotRecorded.
+    #[serde(default)]
+    pub git: crate::git::GitSnapshot,
     /// Host identity used to flag measurements from different machines.
     pub machine: String,
     /// Selected compiler-affecting environment values, excluding arbitrary environment data.

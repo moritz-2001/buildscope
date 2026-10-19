@@ -133,6 +133,7 @@ pub fn run() -> Result<i32> {
                     run.headers.len(),
                     run.profiles.len()
                 );
+                println!("Git: {}", run.git);
                 println!("\nCompilation units:");
                 for unit in &run.project.units {
                     println!("  {}  {} → {}", unit.id, unit.source_key, unit.output_key);
@@ -154,12 +155,14 @@ pub fn run() -> Result<i32> {
             } else {
                 for run in runs {
                     println!(
-                        "{}  {:<11} {:<7} {:>8.3}s  {}",
+                        "{}  {:<11} {:<7} {:>8.3}s  {}  {}",
                         run["id"].as_str().unwrap_or(""),
                         run["status"].as_str().unwrap_or(""),
                         run["kind"].as_str().unwrap_or(""),
                         run["elapsed_ms"].as_f64().unwrap_or_default() / 1000.0,
-                        run["label"].as_str().unwrap_or("")
+                        run["label"].as_str().unwrap_or(""),
+                        serde_json::from_value::<crate::git::GitSnapshot>(run["git"].clone())
+                            .unwrap_or_default()
                     );
                 }
             }
@@ -180,6 +183,11 @@ pub fn run() -> Result<i32> {
                     comparison["after_elapsed_ms"].as_f64().unwrap() / 1000.0,
                     comparison["delta_elapsed_ms"].as_f64().unwrap() / 1000.0
                 );
+                for (label, key) in [("Before Git", "before_git"), ("After Git", "after_git")] {
+                    let git: crate::git::GitSnapshot =
+                        serde_json::from_value(comparison[key].clone())?;
+                    println!("{label}: {git}");
+                }
                 for difference in comparison["differences"].as_array().unwrap() {
                     println!("Difference: {}", difference.as_str().unwrap());
                 }
@@ -220,6 +228,11 @@ pub fn run() -> Result<i32> {
                     result["after"]["median_ms"].as_f64().unwrap() / 1000.0,
                     result["delta_median_ms"].as_f64().unwrap() / 1000.0
                 );
+                for (label, group) in [("Before Git", "before"), ("After Git", "after")] {
+                    let git: crate::git::GitSnapshot =
+                        serde_json::from_value(result[group]["git"].clone())?;
+                    println!("{label}: {git}");
+                }
                 println!("Recorded conditions match: {}", result["conditions_match"]);
             }
             Ok(0)
