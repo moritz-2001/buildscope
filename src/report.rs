@@ -103,6 +103,10 @@ fn handle(
             include_bytes!("web/compiler-work.js"),
             "text/javascript; charset=utf-8",
         )),
+        "/history.js" => Ok(asset(
+            include_bytes!("web/history.js"),
+            "text/javascript; charset=utf-8",
+        )),
         "/tour.js" => Ok(asset(
             include_bytes!("web/tour.js"),
             "text/javascript; charset=utf-8",

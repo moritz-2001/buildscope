@@ -9,6 +9,7 @@ const bytes = value => value >= 1048576 ? (value / 1048576).toFixed(1) + " MiB" 
 const date = value => new Date(value).toLocaleString();
 const state = {run:null,runs:[],view:"overview",q:"",scope:"all",target:"all",sort:"processing_ms",descending:true,detail:null};
 let generation = 0;
+let comparisonGeneration = 0;
 const profileByUnit = new Map();
 const unitById = new Map();
 const actionWork = new Map();
@@ -148,10 +149,10 @@ function findingsHTML(findings) {
     '</p><details><summary class="small muted">Evidence and next experiment</summary><pre class="evidence">'+esc(f.evidence.join("\n"))+
     '</pre><p>'+esc(f.experiment)+'</p></details></div>').join("");
 }
-function render() {
+function render(comparisonSelection = null) {
   if(!state.run)return;
   const run=state.run, launcher=run.kind==="launcher";
-  const titles={overview:"Understand the wait.",headers:"Which headers create work?",compiler:"Compiler work",units:"Why is this file expensive?",history:"Your build history.",compare:"Measure what changed."};
+  const titles={overview:"Understand the wait.",headers:"Which headers create work?",compiler:"Compiler work",units:"Why is this file expensive?",history:"Compilation time over time.",compare:"Measure what changed."};
   $("#title").textContent=titles[state.view];
   $("#breadcrumb").textContent=state.view==="units"?"COMPILATION UNITS":state.view.toUpperCase();
   $("#status").textContent=(BuildscopeTour.active?"Example data · ":"")+run.status+" · "+run.kind; $("#status").className="badge "+run.status;
@@ -188,25 +189,18 @@ function render() {
       notes(["Unexecuted units have no action timing in this run. Compiler phase/subphase measurements may overlap."])+
       table(unitColumns(),sortRows(unitRows()),{action:"unit",id:u=>u.id});
   } else if(state.view==="history") {
-    html='<p class="muted">Ordinary recordings, managed profiles, and collected launcher batches have different timing coverage.</p><div class="panel"><canvas id="history-chart" class="spark" aria-label="Build history"></canvas></div>'+
-      table([
-        {label:"Capture",render:r=>'<span class="path">'+esc(r.id)+'</span><div class="muted small">'+esc(r.label||"")+'</div>'},
-        {label:"When",render:r=>esc(date(r.started_ms))},{label:"Mode",render:r=>pill(r.kind)},
-        {label:"Git",render:r=>gitDetails(r.git)},
-        {label:"Status",render:r=>esc(r.status)},{label:"Observed duration",numeric:true,render:r=>time(r.elapsed_ms)},
-        {label:"Actions",numeric:true,render:r=>num(r.actions)}
-      ],state.runs,{action:"run",id:r=>r.id});
+    html=BuildHistory.shell();
   } else if(state.view==="compare") {
     html='<p class="muted">Match entities and check measurement conditions before interpreting a difference.</p>'+
       '<div class="toolbar"><select id="comparison-mode" aria-label="Comparison mode"><option value="captures">Individual captures</option><option value="series">Repeated measurements by label</option></select></div><div class="comparison-selects">'+
-      '<select id="before-run" aria-label="Before capture">'+runOptions(state.runs.find(r=>r.id!==run.id)?.id||run.id)+'</select>'+
-      '<select id="after-run" aria-label="After capture">'+runOptions(run.id)+'</select><button class="action" id="compare-button">Compare</button></div><div id="comparison"></div>';
+      '<select id="before-run" aria-label="Before capture">'+runOptions(comparisonSelection?.before||state.runs.find(r=>r.id!==run.id)?.id||run.id)+'</select>'+
+      '<select id="after-run" aria-label="After capture">'+runOptions(comparisonSelection?.after||run.id)+'</select><button class="action" id="compare-button">Compare</button></div><div id="comparison"></div>';
   }
   $("#content").innerHTML=html;
   bindFilters();
   if(state.view==="compiler")CompilerWork.load().catch(error=>toast(error.message));
   if(state.view==="overview") drawBuildTimeline();
-  if(state.view==="history") drawHistory();
+  if(state.view==="history") BuildHistory.bind();
   if(state.view==="compare") {
     $("#compare-button").onclick=()=>showComparison().catch(e=>toast(e.message));
     $("#comparison-mode").onchange=()=>{
@@ -442,10 +436,13 @@ async function showSource(path,line) {
   $(".source-line.selected")?.scrollIntoView({block:"center"});
 }
 async function showComparison() {
+  const version=++comparisonGeneration;
+  const current=()=>version===comparisonGeneration&&state.view==="compare"&&$("#comparison");
   const before=$("#before-run").value,after=$("#after-run").value;
   if($("#comparison-mode")?.value==="series") {
     if(!before||!after){$("#comparison").innerHTML=notes(["Record successful captures with before/after experiment labels to compare repeated measurements."]);return;}
     const result=await api("/api/compare-series",{before_label:before,after_label:after});
+    if(!current())return;
     $("#comparison").innerHTML='<div class="metrics">'+metric("Before median",time(result.before.median_ms),num(result.before.count)+" successful samples · "+gitLabel(result.before.git))+
       metric("After median",time(result.after.median_ms),num(result.after.count)+" successful samples · "+gitLabel(result.after.git))+
       metric("Observed median difference",signed(result.delta_median_ms),"Observed duration; launcher batches exclude whole-build work")+
@@ -457,7 +454,7 @@ async function showComparison() {
     return;
   }
   const result=await api("/api/compare",{before,after});
-  if(!$("#comparison"))return;
+  if(!current())return;
   $("#comparison").innerHTML='<div class="metrics">'+metric("Before",time(result.before_elapsed_ms),result.before_timing_scope+" · "+gitLabel(result.before_git))+
     metric("After",time(result.after_elapsed_ms),result.after_timing_scope+" · "+gitLabel(result.after_git))+metric("Observed difference",signed(result.delta_elapsed_ms),"Repeat to establish a stable improvement")+
     metric("Conditions",result.conditions_match?"Match":"Differ","Recorded configuration and capture settings")+'</div>'+
@@ -496,15 +493,6 @@ function canvasContext(canvas) {
   canvas.width=width*ratio;canvas.height=height*ratio;
   const ctx=canvas.getContext("2d");ctx.scale(ratio,ratio);return {ctx,width,height};
 }
-function drawHistory() {
-  const canvas=$("#history-chart");if(!canvas)return;
-  const {ctx,width,height}=canvasContext(canvas);
-  const rows=[...state.runs].filter(r=>r.configuration_id===state.run.project.configuration_id).reverse();
-  const max=Math.max(...rows.map(r=>r.elapsed_ms),1);
-  ctx.fillStyle="#9aa9b3";ctx.font="10px system-ui";ctx.fillText("Compatible configuration · points distinguish record / profile",0,12);
-  for(let i=0;i<rows.length;i++){const x=15+(width-35)*i/Math.max(rows.length-1,1),y=height-10-(height-40)*rows[i].elapsed_ms/max;
-    ctx.fillStyle=rows[i].kind==="record"?"#8adbc0":rows[i].kind==="launcher"?"#edbb7c":"#91baf6";ctx.beginPath();ctx.arc(x,y,4,0,Math.PI*2);ctx.fill();}
-}
 document.addEventListener("click",async event=>{
   const sortable=event.target.closest("[data-sort]");
   if(sortable){
@@ -531,6 +519,11 @@ document.addEventListener("click",async event=>{
     else if(action==="source")await showSource(button.dataset.path,button.dataset.line);
     else if(action==="copy-commit"){await navigator.clipboard.writeText(id);toast("Commit ID copied.");}
     else if(action==="copy-profile"){await navigator.clipboard.writeText(investigationCommand(unitById.get(id)));toast("Investigation command copied.");}
+    else if(action==="history-select"){event.preventDefault();BuildHistory.select(id);}
+    else if(action==="history-baseline"){BuildHistory.baseline(id);}
+    else if(action==="history-compare"){
+      state.view="compare";render({before:button.dataset.before,after:id});
+    }
     else if(action==="run"){await loadRun(id);}
     else if(action==="view"){state.view=id;render();}
     else if(action==="finding"){
@@ -541,7 +534,11 @@ document.addEventListener("click",async event=>{
     }
   }catch(error){toast(error.message);}
 });
-document.addEventListener("keydown",e=>{if((e.key==="Enter"||e.key===" ")&&e.target.matches("tr[data-action],th[data-sort]")){e.preventDefault();e.target.click();}});
+document.addEventListener("keydown",e=>{
+  if(e.key!=="Enter"&&e.key!==" ")return;
+  if(e.target.matches('a[data-action="history-select"]')){e.preventDefault();BuildHistory.select(e.target.dataset.id);}
+  else if(e.target.matches("tr[data-action],th[data-sort]")){e.preventDefault();e.target.click();}
+});
 document.querySelectorAll("nav button").forEach(button=>button.onclick=()=>{
   state.view=button.dataset.view;state.q="";state.sort=["units","compiler"].includes(state.view)?"work":"processing_ms";state.descending=true;
   history.replaceState(null,"",BuildscopeTour.active?"?tour=1#"+state.view:"?run="+encodeURIComponent(state.run.id)+"#"+state.view);render();window.scrollTo(0,0);
@@ -550,7 +547,7 @@ $("#close-detail").onclick=()=>{$("#detail").close();state.detail=null;};
 $("#detail").addEventListener("cancel",()=>state.detail=null);
 $(".brand").onclick=e=>{e.preventDefault();state.view="overview";render();window.scrollTo(0,0);};
 $("#run").onchange=e=>loadRun(e.target.value).catch(error=>toast(error.message));
-window.addEventListener("resize",()=>{if(state.view==="overview")drawBuildTimeline();else if(state.view==="history")drawHistory();});
+window.addEventListener("resize",()=>{if(state.view==="overview")drawBuildTimeline();});
 function showWelcome() {
   $("#title").textContent="Explore Buildscope.";
   $("#breadcrumb").textContent="GETTING STARTED";

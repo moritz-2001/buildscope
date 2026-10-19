@@ -352,7 +352,10 @@ impl Store {
             result.push(json!({"id":run.id,"started_ms":run.started_ms,"status":run.status,"kind":run.kind,
                 "label":run.label,"elapsed_ms":run.elapsed_ms,"actions":run.actions.len(),"units":run.project.units.len(),
                 "headers":run.headers.len(),"configuration_id":run.project.configuration_id,
-                "build_dir":run.project.build_dir,"summary":run.summary,"git":run.git}));
+                "build_dir":run.project.build_dir,"summary":run.summary,"git":run.git,
+                "project_id":run.project.project_id,"machine":run.machine,"targets":run.targets,
+                "environment":run.environment,"cache_policy":run.cache_policy,"jobs":run.jobs,"workload":run.workload,
+                "instrumentation":run.profiles.iter().map(|p| (p.granularity_us,p.verbose)).collect::<std::collections::BTreeSet<_>>()}));
         }
         Ok(result)
     }

@@ -179,6 +179,7 @@ pub fn collect(store: &Store, build_dir: &Path, label: Option<String>) -> Result
         label, machine: first.machine.clone(), environment: first.environment.clone(),
         git: crate::git::summarize(observations.iter().map(|(_, observation)| &observation.git)),
         cache_policy: "preserved; individual outcomes unknown".into(), profile_origin: None, targets: Vec::new(),
+        jobs: None, workload: None,
         project: inventory.clone(), actions: Vec::new(), profiles: Vec::new(), headers: Vec::new(),
         inputs: BTreeMap::new(), changes: Vec::new(), findings: Vec::new(), summary: BuildSummary::default(),
         notes: vec![
@@ -348,6 +349,7 @@ pub fn collect(store: &Store, build_dir: &Path, label: Option<String>) -> Result
         "success"
     }
     .into();
+    run.workload = Some(crate::workload::collect(&run, &root));
     analysis::analyze(&mut run, "");
     // A compiler-only batch has no observed generator/link dependency chain.
     run.summary.dependency_path.clear();

@@ -346,6 +346,7 @@ pub fn recover(store: &Store, id: &str) -> Result<Capture> {
     capture.finished_ms = Some(now_ms());
     capture.notes.push("Recovered partial artifacts; absent timing or dependency data was not inferred from subsequent builds.".into());
     decode_invocations(store, &mut capture, false)?;
+    capture.workload = Some(crate::workload::collect(&capture, &root));
     analysis::analyze(&mut capture, &explanation);
     store.save(&capture)?;
     Ok(capture)
@@ -500,7 +501,7 @@ fn execute(
         cache_policy: if instrumented {
             "bypassed"
         } else {
-            "preserved; individual outcomes unknown"
+            "preserved; outcomes recorded when supported"
         }
         .into(),
         profile_origin: fs::read(Path::new(&project.build_dir).join(".buildscope-profile.json"))
@@ -513,6 +514,8 @@ fn execute(
                     .map(str::to_owned)
             }),
         targets: request.targets.clone(),
+        jobs: request.jobs,
+        workload: None,
         project,
         actions: Vec::new(),
         profiles: Vec::new(),
@@ -526,6 +529,11 @@ fn execute(
     if let Some(previous) = &previous {
         capture.changes = project::changes(&previous.inputs, &before_inputs, false);
     }
+    if let Err(error) = crate::workload::prepare(&capture, &root) {
+        capture
+            .notes
+            .push(format!("Workload command evidence unavailable: {error:#}"));
+    }
     store.save(&capture)?;
     eprintln!("Buildscope {}: {}", kind, capture.id);
     let mut command = Command::new("ninja");
@@ -537,6 +545,9 @@ fn execute(
         command.arg("-j").arg(jobs.to_string());
     }
     command.args(&request.targets);
+    // ccache locks its per-build log, so parallel compilers can safely append without
+    // sampling shared cache counters or resetting another build's statistics.
+    command.env("CCACHE_STATSLOG", root.join("ccache.stats"));
     if instrumented {
         command
             .env("BUILDSCOPE_RUN_DIR", &root)
@@ -630,6 +641,7 @@ fn execute(
         .filter(|path| !capture.inputs.contains_key(path))
         .collect::<std::collections::BTreeSet<_>>();
     capture.inputs.extend(project::snapshot(observed_paths));
+    capture.workload = Some(crate::workload::collect(&capture, &root));
     analysis::analyze(&mut capture, &explanation);
     if capture
         .project

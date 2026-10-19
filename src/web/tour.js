@@ -15,7 +15,7 @@ const BuildscopeTour = (() => {
     {view:"units",detail:"summary",target:"#unit-detail",title:"Inspect compiler activity",text:"The summary shows recorded phases and detail coverage for render.cpp. Tabs separate templates, functions, constant evaluation, includes, trace events, and the original command. Real captures can retain raw evidence and provide a focused profiling command.",hint:"This sample profile uses Clang. GCC supplies aggregate timers rather than individual template or header timings."},
     {view:"units",detail:"templates",target:"#unit-detail",title:"Identify costly template spellings",text:"Mesh<Vertex>::upload() accounts for 1.8 seconds of inclusive recorded work. Compare exact spellings, counts, and longest events. Approximate family grouping helps browse similar specializations.",hint:"Try the grouping checkbox or a source link. Inclusive template timings must not be added as independent elapsed time."},
     {view:"units",detail:"trace",target:"#unit-detail",title:"Zoom into recorded scopes",text:"Search events, filter by compiler activity, or switch to chronological order. Open an event to inspect its immediate recorded children and containing scope. These times are local to one compiler invocation.",hint:"Try filtering for Mesh, or opening the Frontend event. Time containment is not a semantic template dependency graph."},
-    {view:"history",target:"#content",title:"Keep measurement modes in context",text:"The example history contains three ordinary builds before a change, three after, and a separate instrumented profile. Click a capture to inspect it. The chart distinguishes recording from profiling.",hint:"Profiles add instrumentation overhead. Compare ordinary builds with ordinary builds under matching conditions."},
+    {view:"history",target:"#content",title:"Keep measurement modes in context",text:"The example history contains three ordinary builds before a change, three after, and a separate instrumented profile. Select a chart point or table row, then open its capture. The duration plot aligns with compiled, cached, unknown, and up-to-date unit counts. Choose a baseline and inspect workload changes.",hint:"Profiles add instrumentation overhead. Compare ordinary builds with ordinary builds under matching conditions."},
     {view:"compare",target:"#comparison",title:"Check a change with repeated builds",text:"The first ordinary build falls from 8.0 to 5.4 seconds after reducing header work. Matched units and headers show where measurements differ. Switch to repeated measurements by label to see medians, spread, and sample counts.",hint:"The three before samples have an 8.0-second median; after has 5.6 seconds. Matching conditions support comparison, but do not prove causality."},
     {view:"overview",target:"#content .metrics",title:"Ready to investigate your build",text:"Start with elapsed time and coverage, follow a finding or costly header into its units, then use compiler detail to design an experiment. Record repeated before/after builds to check the result.",hint:"Finish returns to your original capture and filters. You can replay this tour anytime from the sidebar."}
   ];
@@ -147,8 +147,8 @@ function createExampleData() {
     directory:build,arguments:["clang++","-O2","-I"+source+"/include","-c",source+"/src/"+name+".cpp"],response_files:{}}));
   const profile = {
     id:"example-profile",label:"Example · compiler investigation",kind:"profile",status:"success",started_ms:1792317600000,
-    elapsed_ms:12000,cache_policy:"bypassed in isolated example profile",targets:["viewer"],
-    project:{source_dir:source,build_dir:build,build_type:"Release",configuration_id:"example-clang-release",units,
+    elapsed_ms:12000,jobs:4,machine:"example-host",environment:{},cache_policy:"bypassed in isolated example profile",targets:["viewer"],
+    project:{project_id:"example-atlas",source_dir:source,build_dir:build,build_type:"Release",configuration_id:"example-clang-release",units,
       compilers:[{family:"clang",version:"Clang 20.1.8 · illustrative example"}]},
     actions:[{kind:"generate",start_ms:0,end_ms:400,outputs:[build+"/generated/config.hpp"]},
       ...units.map((u,i)=>({kind:"compile",unit_id:u.id,start_ms:400,end_ms:[9400,6400,2400][i],outputs:[build+"/"+u.output_key]})),
@@ -197,8 +197,13 @@ function createExampleData() {
       captures.push(run);
     });
   }
+  // Fictional outcomes exercise the same workload report contract as real captures.
+  for(const run of captures)run.workload={compiled:3,cache_hits:0,unknown:0,up_to_date:0,total_units:3,
+    source_files:3,executed_units:units.map(u=>u.id).sort(),notes:["Synthetic workload evidence for the guided tour."]};
   const runs = [...captures].sort((a,b)=>b.started_ms-a.started_ms).map(r=>({id:r.id,label:r.label,kind:r.kind,status:r.status,
-    started_ms:r.started_ms,elapsed_ms:r.elapsed_ms,configuration_id:r.project.configuration_id,actions:r.actions.length}));
+    started_ms:r.started_ms,elapsed_ms:r.elapsed_ms,configuration_id:r.project.configuration_id,actions:r.actions.length,
+    project_id:r.project.project_id,machine:r.machine,environment:r.environment,targets:r.targets,
+    cache_policy:r.cache_policy,jobs:r.jobs,workload:r.workload,instrumentation:r.profiles.map(p=>[p.granularity_us,p.verbose||false])}));
   function capture(id) {
     const run = captures.find(r=>r.id===id);
     if (!run) throw new Error("Example capture unavailable.");

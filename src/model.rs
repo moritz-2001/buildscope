@@ -33,8 +33,14 @@ pub struct Capture {
     pub machine: String,
     /// Selected compiler-affecting environment values, excluding arbitrary environment data.
     pub environment: BTreeMap<String, String>,
-    /// Cache treatment; ordinary recordings preserve caches with unknown hit outcomes.
+    /// Cache treatment; ordinary recordings preserve caches and report observed outcomes separately.
     pub cache_policy: String,
+    /// Explicit Ninja job limit; None means the default or an older capture without job metadata.
+    #[serde(default)]
+    pub jobs: Option<usize>,
+    /// Measured compilation workload; None means this older capture did not collect outcomes.
+    #[serde(default)]
+    pub workload: Option<CompilationWorkload>,
     /// Original build behind a managed profile tree; None when the build is not managed.
     pub profile_origin: Option<String>,
     /// Requested targets; empty means Ninja defaults.
@@ -57,6 +63,29 @@ pub struct Capture {
     pub notes: Vec<String>,
     /// Metrics derived from this run's action set.
     pub summary: BuildSummary,
+}
+
+/// Counts successful compilation units separately from cache reuse and unobserved outcomes.
+/// A source compiled for multiple outputs counts once per output. Repeated executions of
+/// one unit remain unknown because cache logs cannot reliably associate them with a unit.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CompilationWorkload {
+    /// Successful units known to have run the compiler, from direct commands or ccache misses.
+    pub compiled: usize,
+    /// Successful units served by a confirmed ccache direct or preprocessed cache hit.
+    pub cache_hits: usize,
+    /// Executed units without an unambiguous successful compiler/cache outcome.
+    pub unknown: usize,
+    /// Requested units skipped by a successful Ninja build; None for partial or launcher captures.
+    pub up_to_date: Option<usize>,
+    /// Compilation inventory within the requested Ninja graph; None when scope is unavailable.
+    pub total_units: Option<usize>,
+    /// Distinct source paths among executed units; multiple target outputs can share one source.
+    pub source_files: usize,
+    /// Sorted executed unit identities used to detect workload changes beyond the count alone.
+    pub executed_units: Vec<String>,
+    /// Evidence sources and coverage limits retained with the counts for reports and archives.
+    pub notes: Vec<String>,
 }
 
 /// Configured CMake and Ninja inventory.

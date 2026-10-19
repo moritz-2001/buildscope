@@ -339,3 +339,33 @@ the library interfaces.
 copied into temporary paths containing spaces. It verifies that ordinary builds,
 isolated profiles, cancellation, failures, generated headers, PCH, unity sources,
 and archive exchange preserve their intended public behavior.
+
+## Compilation workload and history
+
+[workload.rs](src/workload.rs) joins successful Ninja source/output actions with
+capture-local ccache statistics and known direct compiler commands. It produces
+`Capture.workload` (`CompilationWorkload` in [model.rs](src/model.rs)), retaining
+compiled, cache-hit, unknown, and scoped up-to-date counts, distinct source count,
+and executed unit identities. `None` preserves unknown coverage in legacy captures.
+`Capture.jobs` retains requested parallelism for new recordings. Neither field
+requires changing the version-1 SQLite layout; serde defaults keep old manifests
+and archives readable. Workload evidence is captured before saving lightweight
+report summaries, so imports never inspect today's compiler or cache state.
+
+[capture.rs](src/capture.rs) sets a private `CCACHE_STATSLOG` for Ninja children and
+snapshots command classification and ccache prefix configuration before execution
+in `workload.commands.json`, then collects outcomes after action and compiler-detail
+decoding. Recovery only reads retained evidence and never probes saved executables.
+[launcher.rs](src/launcher.rs) also derives observed workload while preserving its
+partial compiler-batch scope. Missing cache evidence, ambiguous source matches,
+and unsupported wrappers remain unknown. Up-to-date counts require a successful
+whole-build recording and the requested Ninja graph, rather than subtraction from
+the entire compilation database. See [measurement semantics](docs/compilation-history.md).
+
+`Store::list` in [store.rs](src/store.rs) serves saved workload and comparison
+conditions through `/api/runs`. [history.js](src/web/history.js) filters compatible
+series and renders aligned duration/workload SVG plots, exact-count tables,
+scenario/date filters, baseline selection, and capture/comparison drill-down.
+Failed captures break the duration line and cannot contribute to deltas. Tests
+cover pure series semantics, legacy serialization, real Ninja clean/no-op/partial
+builds, real ccache miss/hit cycles, and archive round trips.

@@ -25,6 +25,13 @@ fn clean_noop_incremental_generator_and_failed_builds_have_distinct_evidence() {
     let clean = fixture.latest();
     assert_eq!(clean.status, "success");
     assert_eq!(clean.summary.observed_units, 3);
+    let workload = clean.workload.as_ref().unwrap();
+    assert_eq!(
+        (workload.compiled, workload.cache_hits, workload.unknown),
+        (3, 0, 0)
+    );
+    assert_eq!(workload.up_to_date, Some(0));
+    assert_eq!(workload.total_units, Some(3));
     assert_eq!(clean.actions.len(), 5);
     assert!(clean.actions.iter().any(|a| a.kind == "link"));
     let shared = clean
@@ -43,6 +50,7 @@ fn clean_noop_incremental_generator_and_failed_builds_have_distinct_evidence() {
     assert!(noop.status.success(), "{}", diagnostics(&noop));
     let noop = fixture.latest();
     assert!(noop.actions.is_empty());
+    assert_eq!(noop.workload.as_ref().unwrap().up_to_date, Some(3));
     assert_eq!(
         noop.project.configuration_id,
         clean.project.configuration_id
@@ -79,6 +87,8 @@ fn clean_noop_incremental_generator_and_failed_builds_have_distinct_evidence() {
     assert!(generator.status.success(), "{}", diagnostics(&generator));
     let generated = fixture.latest();
     assert_eq!(generated.summary.observed_units, 1);
+    assert_eq!(generated.workload.as_ref().unwrap().compiled, 1);
+    assert_eq!(generated.workload.as_ref().unwrap().up_to_date, Some(2));
     assert!(generated.actions.iter().any(|a| a.kind == "generate"));
     assert!(
         generated
@@ -94,6 +104,7 @@ fn clean_noop_incremental_generator_and_failed_builds_have_distinct_evidence() {
     assert!(!failed.status.success());
     let failed_run = fixture.latest();
     assert_eq!(failed_run.status, "failed");
+    assert_eq!(failed_run.workload.as_ref().unwrap().up_to_date, None);
     assert!(
         failed_run
             .notes
@@ -106,6 +117,165 @@ fn clean_noop_incremental_generator_and_failed_builds_have_distinct_evidence() {
         .header_history(&changed, "shared.hpp")
         .unwrap();
     assert!(history.iter().any(|h| h["explicit_trigger"] == true));
+}
+
+#[test]
+fn ccache_outcomes_are_build_local_and_survive_archives() {
+    let Some(compiler) = clang() else {
+        return;
+    };
+    let ccache = std::env::var("BUILDSCOPE_TEST_CCACHE").unwrap_or_else(|_| "ccache".into());
+    if !Command::new(&ccache)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        eprintln!("Skipping real ccache workflow: ccache is unavailable");
+        return;
+    }
+    let fixture = Fixture::new(
+        &compiler,
+        &[&format!("-DCMAKE_CXX_COMPILER_LAUNCHER={ccache}")],
+    );
+    let shared_log = fixture.root.path().join("unrelated.stats");
+    fs::write(&shared_log, "# unrelated.cpp\ndirect_cache_hit\n").unwrap();
+    let cache = fixture.root.path().join("ccache");
+    let record = |prefix: Option<&Path>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_buildscope"));
+        command
+            .arg("--store")
+            .arg(&fixture.store_path)
+            .args(["record", "--build-dir"])
+            .arg(&fixture.build)
+            .args(["--target", "app", "--jobs", "4"])
+            .env("CCACHE_DIR", &cache)
+            .env("CCACHE_STATSLOG", &shared_log)
+            .env_remove("CCACHE_DISABLE")
+            .env_remove("CCACHE_RECACHE")
+            .env_remove("CCACHE_PREFIX");
+        if let Some(prefix) = prefix {
+            command.env("CCACHE_PREFIX", prefix);
+        }
+        command.output().unwrap()
+    };
+    let first = record(None);
+    assert!(first.status.success(), "{}", diagnostics(&first));
+    let miss = fixture.latest();
+    let counts = miss.workload.as_ref().unwrap();
+    assert_eq!(
+        (counts.compiled, counts.cache_hits, counts.unknown),
+        (3, 0, 0),
+        "{counts:?}"
+    );
+    assert_eq!(miss.jobs, Some(4));
+    for unit in &miss.project.units {
+        fs::remove_file(&unit.output).unwrap();
+    }
+    let hit = record(None);
+    assert!(hit.status.success(), "{}", diagnostics(&hit));
+    let hit = fixture.latest();
+    let counts = hit.workload.as_ref().unwrap();
+    assert_eq!(
+        (counts.compiled, counts.cache_hits, counts.unknown),
+        (0, 3, 0),
+        "{counts:?}"
+    );
+    assert_eq!(counts.up_to_date, Some(0));
+    assert_eq!(
+        fs::read_to_string(&shared_log).unwrap(),
+        "# unrelated.cpp\ndirect_cache_hit\n"
+    );
+    let noop = record(None);
+    assert!(noop.status.success(), "{}", diagnostics(&noop));
+    let noop = fixture.latest().workload.unwrap();
+    assert_eq!(
+        (
+            noop.compiled,
+            noop.cache_hits,
+            noop.unknown,
+            noop.up_to_date
+        ),
+        (0, 0, 0, Some(3))
+    );
+    let archive = fixture.root.path().join("cached.buildscope");
+    fixture.store().export(&hit.id, &archive, true).unwrap();
+    let imported = Store::open(&fixture.root.path().join("imported")).unwrap();
+    imported.import(&archive).unwrap();
+    assert_eq!(
+        imported.load(&hit.id).unwrap().workload.unwrap().cache_hits,
+        3
+    );
+    assert_eq!(imported.list().unwrap()[0]["workload"]["cache_hits"], 3);
+    // Retained logs, rather than cache counters or durations, govern recovery too.
+    let stats_path = fixture
+        .store()
+        .run_dir(&hit.id)
+        .unwrap()
+        .join("ccache.stats");
+    append(
+        &stats_path,
+        &format!("# {}\ndirect_cache_hit\n", hit.project.units[0].source),
+    );
+    let mut interrupted = hit.clone();
+    interrupted.status = "interrupted".into();
+    fixture.store().save(&interrupted).unwrap();
+    let recovered = capture::recover(&fixture.store(), &hit.id).unwrap();
+    let partial = recovered.workload.unwrap();
+    assert_eq!(
+        (partial.cache_hits, partial.unknown, partial.up_to_date),
+        (2, 1, None)
+    );
+    fs::remove_file(stats_path).unwrap();
+    let recovered = capture::recover(&fixture.store(), &hit.id).unwrap();
+    let missing = recovered.workload.unwrap();
+    assert_eq!(
+        (missing.compiled, missing.cache_hits, missing.unknown),
+        (0, 0, 3)
+    );
+    let prefix = fixture.root.path().join("compiler-prefix");
+    fs::write(&prefix, "#!/bin/sh\nexec \"$@\"\n").unwrap();
+    fs::set_permissions(&prefix, fs::Permissions::from_mode(0o755)).unwrap();
+    append(
+        &fixture.source.join("shared.hpp"),
+        "\ninline int prefix_probe() { return 421; }\n",
+    );
+    let output = record(Some(&prefix));
+    assert!(output.status.success(), "{}", diagnostics(&output));
+    let prefixed = fixture.latest().workload.unwrap();
+    assert_eq!(
+        (prefixed.compiled, prefixed.cache_hits, prefixed.unknown),
+        (0, 0, 3)
+    );
+}
+
+#[test]
+fn workload_scope_excludes_unrequested_compilation_database_entries() {
+    let Some(compiler) = clang() else {
+        return;
+    };
+    let fixture = Fixture::new(&compiler, &[]);
+    fs::write(
+        fixture.source.join("unused.cpp"),
+        "int unused() { return 0; }\n",
+    )
+    .unwrap();
+    append(
+        &fixture.source.join("CMakeLists.txt"),
+        "\nadd_library(unrequested OBJECT EXCLUDE_FROM_ALL unused.cpp)\n",
+    );
+    fixture.configure(&compiler, &[]);
+    let output = fixture.run(&["record"]);
+    assert!(output.status.success(), "{}", diagnostics(&output));
+    let clean = fixture.latest();
+    assert_eq!(clean.project.units.len(), 4);
+    let workload = clean.workload.unwrap();
+    assert_eq!(
+        (workload.total_units, workload.up_to_date, workload.compiled),
+        (Some(3), Some(0), 3)
+    );
+    let output = fixture.run(&["record"]);
+    assert!(output.status.success(), "{}", diagnostics(&output));
+    assert_eq!(fixture.latest().workload.unwrap().up_to_date, Some(3));
 }
 
 #[test]
@@ -183,6 +353,7 @@ fn deep_clang_profiles_are_isolated_searchable_and_portable() {
     let imported = Store::open(&fixture.root.path().join("imported")).unwrap();
     let id = imported.import(&archive).unwrap();
     assert_eq!(imported.load(&id).unwrap().summary.observed_units, 3);
+    assert_eq!(imported.load(&id).unwrap().workload.unwrap().compiled, 3);
     assert_eq!(
         imported
             .events(

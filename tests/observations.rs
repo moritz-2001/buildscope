@@ -1254,6 +1254,8 @@ fn capture_fixture(root: &Path) -> Capture {
         machine: "test-host".into(),
         environment: BTreeMap::new(),
         cache_policy: "preserved".into(),
+        jobs: None,
+        workload: None,
         profile_origin: None,
         targets: vec![],
         project: project_fixture(root),
@@ -1273,8 +1275,12 @@ fn old_capture_metadata_defaults_to_not_recorded() {
     let temp = tempfile::tempdir().unwrap();
     let mut manifest = serde_json::to_value(capture_fixture(temp.path())).unwrap();
     manifest.as_object_mut().unwrap().remove("git");
+    manifest.as_object_mut().unwrap().remove("workload");
+    manifest.as_object_mut().unwrap().remove("jobs");
     let capture: Capture = serde_json::from_value(manifest).unwrap();
     assert_eq!(capture.git.status, buildscope::git::GitStatus::NotRecorded);
+    assert!(capture.workload.is_none());
+    assert_eq!(capture.jobs, None);
     let store = Store::open(&temp.path().join("store")).unwrap();
     store.save(&capture).unwrap();
     let archive = temp.path().join("old.buildscope");

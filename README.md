@@ -405,3 +405,14 @@ suite, JavaScript checks, UI-tour tests, and a release build with their installe
 toolchains.
 
 See [architecture](ARCHITECTURE.md) for interfaces and invariants.
+
+### Compilation time trends
+
+**Build history** aligns elapsed build time with compiled, cache-hit, unknown, and
+up-to-date compilation-unit counts. Choose a baseline to see duration changes,
+filter by scenario label or date, and select a point to inspect or compare captures.
+Workload changes are explicit so fewer rebuilt units or more cache hits do not
+appear as faster compilation. Ordinary recordings automatically collect build-local
+ccache outcomes; unsupported caches and older captures retain unknown coverage.
+See [compilation history](docs/compilation-history.md) for collection and comparison
+semantics.

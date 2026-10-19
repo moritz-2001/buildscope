@@ -107,6 +107,16 @@ pub fn trigger_evidence(text: &str, build: &Path) -> BTreeMap<String, Vec<String
     reasons
 }
 
+/// Collection coverage is independent of cache treatment. Older captures used a
+/// longer preserved-policy description before per-build outcomes were collected.
+fn normalized_cache_policy(policy: &str) -> &str {
+    if policy.starts_with("preserved") {
+        "preserved"
+    } else {
+        policy
+    }
+}
+
 /// Compare matched units/headers and disclose configuration differences before interpreting time.
 pub fn compare(before: &Capture, after: &Capture) -> Value {
     let mut differences = Vec::new();
@@ -123,13 +133,17 @@ pub fn compare(before: &Capture, after: &Capture) -> Value {
         differences
             .push("Capture modes differ in instrumentation, cache policy, or timing coverage.");
     }
+    if before.jobs != after.jobs {
+        differences.push("Requested Ninja parallelism differs.");
+    }
     if before.targets != after.targets {
         differences.push("Requested target sets differ.");
     }
     if before.environment != after.environment {
         differences.push("Recorded compiler-affecting environment differs.");
     }
-    if before.cache_policy != after.cache_policy {
+    if normalized_cache_policy(&before.cache_policy) != normalized_cache_policy(&after.cache_policy)
+    {
         differences.push("Recorded cache policies differ.");
     }
     let detail = |run: &Capture| {
@@ -179,7 +193,7 @@ pub fn compare(before: &Capture, after: &Capture) -> Value {
         "before":before.id,"after":after.id,"before_git":before.git,"after_git":after.git,
         "conditions_match":differences.is_empty(),
         "differences":differences,"limitations":["Single-run differences are observations, not proof of repeatable savings.",
-        "Ordinary recordings preserve compiler caches; individual cache hit outcomes are unknown.",
+        "Ordinary recordings preserve compiler caches. Only retained cache-outcome evidence establishes hits or compiler executions.",
         "Only units executed in both captures have paired action timings.",
         "Launcher durations describe a collected compiler span, possibly across builds, and exclude links and generators."],
         "before_elapsed_ms":before.elapsed_ms,"after_elapsed_ms":after.elapsed_ms,
@@ -200,12 +214,14 @@ pub fn compare_series(before: &[Capture], after: &[Capture]) -> anyhow::Result<V
             .map(|p| (p.granularity_us, p.verbose))
             .collect::<BTreeSet<_>>();
         serde_json::to_string(&(
+            &run.project.project_id,
             &run.project.configuration_id,
             &run.machine,
             &run.kind,
             &run.targets,
+            &run.jobs,
             &run.environment,
-            &run.cache_policy,
+            normalized_cache_policy(&run.cache_policy),
             detail,
         ))
         .unwrap()
@@ -235,7 +251,7 @@ pub fn compare_series(before: &[Capture], after: &[Capture]) -> anyhow::Result<V
     Ok(
         json!({"before":before,"after":after,"conditions_match":keys.len()==1,
         "delta_median_ms":delta,"limitations":[
-            "Samples include successful captures only. Ordinary compiler-cache hit outcomes remain unknown.",
+            "Samples include successful captures only. Cache outcomes require retained evidence; unsupported caches remain unknown.",
             "Launcher samples describe collected compiler spans, not whole builds; batch boundaries must be controlled separately.",
             "Different machines, configurations, modes, targets, environments, or instrumentation make the groups incompatible.",
             "Distributions describe the collected samples; they do not establish exclusive causation for a code change."]}),

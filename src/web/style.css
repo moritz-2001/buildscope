@@ -682,3 +682,30 @@ button:disabled { opacity:.45; cursor:default; }
   #tour-panel { left:8px; right:8px; bottom:8px; width:auto; max-height:43dvh; padding:14px; }
   .tour-active main,.tour-active #detail { padding-bottom:calc(43dvh + 30px); }
 }
+/* History keeps duration, workload bars, exact counts, and accessible selection together. */
+.history-filters label {display:grid;gap:6px;min-width:150px;flex:1}
+.history-filters select {max-width:100%}
+.workload-counts {display:flex;flex-wrap:wrap;gap:12px 24px;margin:14px 0}
+.workload-count {display:inline-flex;align-items:center;gap:7px}
+.workload-count i {display:inline-block;width:10px;height:10px;border-radius:2px}
+.history-scroll {overflow-x:auto}
+.history-graph {display:block;min-width:100%;max-width:none;height:auto}
+.history-graph text {fill:var(--muted);font:11px system-ui}
+.history-grid {stroke:var(--line);stroke-width:1}
+.history-line {fill:none;stroke:var(--green);stroke-width:2}
+.history-baseline {stroke:var(--blue);stroke-width:1;stroke-dasharray:5 5}
+.history-point {fill:var(--green);stroke:var(--bg);stroke-width:2}
+.history-failed {fill:var(--orange)}
+.history-hit {fill:transparent}
+.history-graph a {cursor:pointer;outline:none}
+.history-graph a:hover .history-hit,.history-graph a:focus .history-hit,.history-graph a[aria-current] .history-hit {fill:#91baf611;stroke:var(--blue);stroke-width:1}
+#history-panel .metrics {grid-template-columns:repeat(3,minmax(0,1fr))}
+#history-panel .metric:last-child .number {font-size:21px;line-height:1.3;margin:12px 0}
+.history-selection {margin:16px 0 24px}
+.history-selection .toolbar {margin:10px 0}
+@media(max-width:760px) {#history-panel .metrics {grid-template-columns:1fr}}
+
+.workload-count i.compiled {background:var(--green)}
+.workload-count i.cache_hits {background:var(--blue)}
+.workload-count i.unknown {background:var(--orange)}
+.workload-count i.up_to_date {background:#657681}
