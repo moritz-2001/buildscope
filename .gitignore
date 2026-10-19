@@ -1,3 +1,4 @@
 /target/
 .buildscope/
 .buildscope-launcher/
+.DS_Store
