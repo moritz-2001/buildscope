@@ -53,7 +53,8 @@ function table(columns, rows, rowAction, page=0) {
   queueMicrotask(()=>{const node=document.querySelector('[data-table="'+id+'"]');if(node)tableBindings.set(node,binding);});
   return '<div data-table="'+id+'"><div class="table-wrap"><table><thead><tr>' + columns.map(c =>
     '<th class="' + (c.numeric ? "numeric " : "") + (c.key ? "sortable" : "") + '"' +
-    (c.key ? ' tabindex="0" role="button" data-sort="' + esc(c.key) + '"' : "") + '>' + esc(c.label) +
+    (c.key ? ' tabindex="0" role="button" data-sort="' + esc(c.key) + '"' : "") +
+    (c.tooltip ? ' title="' + esc(c.tooltip) + '" aria-description="' + esc(c.tooltip) + '"' : "") + '>' + esc(c.label) +
     (state.sort === c.key ? state.descending ? " ↓" : " ↑" : "") + '</th>').join("") +
     '</tr></thead><tbody>' + visible.map(row => '<tr' + (rowAction ? ' class="clickable" tabindex="0" data-action="' + rowAction.action +
       '" data-id="' + esc(rowAction.id(row)) + '"' : "") + '>' + columns.map(c =>
@@ -105,14 +106,28 @@ function unitRows() {
 }
 function headerColumns() {
   return [
-    {label:"Header",key:"key",render:h=>'<span class="path">' + esc(h.key) + '</span><div class="small muted">' +
+    {label:"Header",key:"key",
+      tooltip:"Header path in the dependency inventory or compiler observations. Click a row to inspect its include paths and dependent units. Supported rebuild trigger means Ninja explicitly named this header as a dirty input and dependents rebuilt; Changed contributor means the header changed and dependents rebuilt, without explicit trigger evidence.",
+      render:h=>'<span class="path">' + esc(h.key) + '</span><div class="small muted">' +
       (h.explicit_trigger?"Supported rebuild trigger":h.changed_contributor?"Changed contributor":"") + '</div>'},
-    {label:"Source files / units",key:"reach",numeric:true,render:h=>num(h.source_count)+" / "+num(h.reach)},
-    {label:"Direct · recorded",key:"direct",numeric:true,render:h=>num(h.direct)},
-    {label:"Processing · capture total",key:"processing_ms",numeric:true,render:h=>time(h.processing_ms)},
-    {label:"Units rebuilt",key:"rebuilt",numeric:true,render:h=>num(h.rebuilt)},
-    {label:"Associated compile work",key:"work",numeric:true,render:h=>time(h.work)},
-    {label:"Native trigger · ordinary builds",key:"trigger_count",numeric:true,render:h=>h.history?.record?
+    {label:"Source files / units",key:"reach",numeric:true,
+      tooltip:"Distinct source files / compilation units that depend on this header, directly or indirectly, within the selected target. A unit is a source/output pair, so one source compiled into multiple targets can count as multiple units. Includes units that did not rebuild; dependency records may come from earlier compilations.",
+      render:h=>num(h.source_count)+" / "+num(h.reach)},
+    {label:"Direct · recorded",key:"direct",numeric:true,
+      tooltip:"Number of distinct compilation units in the selected target where compiler observations recorded this header as directly included by the source (include depth 1). A zero does not prove there are no direct includes: include observations may be incomplete or unavailable.",
+      render:h=>num(h.direct)},
+    {label:"Processing · capture total",key:"processing_ms",numeric:true,
+      tooltip:"Sum of measured inclusive processing time for this header across profiled units in the entire capture. Includes time in nested headers, so header totals can overlap. This value does not change with the target filter. Unavailable means no timing was measured; it does not mean zero cost. This is not an estimate of time saved by removing the header.",
+      render:h=>time(h.processing_ms)},
+    {label:"Units rebuilt",key:"rebuilt",numeric:true,
+      tooltip:"Number of distinct dependent compilation units in the selected target with a recorded compile action in this capture. Counts each unit once, even if it has multiple actions. Rebuilding does not by itself establish that this header caused the rebuild.",
+      render:h=>num(h.rebuilt)},
+    {label:"Associated compile work",key:"work",numeric:true,
+      tooltip:"Sum of full compile action durations for rebuilt units that depend on this header, directly or indirectly, in this capture and selected target. A unit's full duration is attributed to every header it depends on, so header rows overlap and should not be added together. Parallel work can exceed elapsed build time. This is not the header's processing time or an estimate of time saved by removing it.",
+      render:h=>time(h.work)},
+    {label:"Native trigger · ordinary builds",key:"trigger_count",numeric:true,
+      tooltip:"Ordinary recorded builds where Ninja explicitly identified this header as a dirty input and dependents rebuilt / ordinary recorded builds containing this header. History uses the same build configuration and recorded target set, excludes instrumented profiles, and does not change with the UI target filter. No history means no compatible ordinary recordings are available.",
+      render:h=>h.history?.record?
       num(h.history.record.trigger_runs)+" / "+num(h.history.record.captures):"No history"}
   ];
 }
