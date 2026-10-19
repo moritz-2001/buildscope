@@ -276,6 +276,257 @@ fn changes_and_shared_rebuilds_keep_contributors_separate_from_native_triggers()
 }
 
 #[test]
+fn running_checkpoints_survive_reopening_and_defer_reports_until_requested() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut capture = capture_fixture(temp.path());
+    capture.status = "running".into();
+    capture.finished_ms = None;
+    capture.project.dependencies.insert(
+        capture.project.units[0].output.clone(),
+        vec![path_string(temp.path().join("shared.hpp"))],
+    );
+    let root = temp.path().join("store");
+    Store::open(&root).unwrap().save(&capture).unwrap();
+
+    let store = Store::open(&root).unwrap();
+    assert_eq!(
+        serde_json::to_value(store.load(&capture.id).unwrap()).unwrap(),
+        serde_json::to_value(&capture).unwrap()
+    );
+    let database = rusqlite::Connection::open(root.join("index.sqlite3")).unwrap();
+    let indexed_units = || {
+        database
+            .query_row("SELECT count(*) FROM report_units", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(indexed_units(), 0);
+    database
+        .execute_batch(
+            "CREATE TRIGGER fail_report BEFORE INSERT ON report_units
+        BEGIN SELECT RAISE(ABORT,'injected report failure'); END;",
+        )
+        .unwrap();
+    assert!(store.overview(&capture.id).is_err());
+    assert_eq!(
+        database
+            .query_row("SELECT count(*) FROM report_runs", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(indexed_units(), 0);
+    database.execute_batch("DROP TRIGGER fail_report").unwrap();
+    assert_eq!(store.overview(&capture.id).unwrap()["status"], "running");
+    assert_eq!(indexed_units(), 1);
+    assert!(
+        store
+            .unit_detail(&capture.id, &capture.project.units[0].id)
+            .is_ok()
+    );
+
+    // A retry must invalidate an on-demand report of the earlier checkpoint.
+    capture.project.units[0].source_key = "updated.cpp".into();
+    store.save(&capture).unwrap();
+    assert_eq!(indexed_units(), 0);
+    assert_eq!(store.overview(&capture.id).unwrap()["status"], "running");
+    assert_eq!(
+        store
+            .unit_detail(&capture.id, &capture.project.units[0].id)
+            .unwrap()["unit"]["source_key"],
+        "updated.cpp"
+    );
+
+    // Recovery consumes the durable manifest even when no compiler artifacts exist yet.
+    let recovered = capture::recover(&store, &capture.id).unwrap();
+    assert_eq!(recovered.status, "interrupted");
+    assert_eq!(recovered.project.dependencies, capture.project.dependencies);
+    assert_eq!(
+        store.overview(&capture.id).unwrap()["status"],
+        "interrupted"
+    );
+    assert!(
+        store
+            .header_detail(&capture.id, &path_string(temp.path().join("shared.hpp")))
+            .is_ok()
+    );
+}
+
+#[test]
+fn large_action_inventories_keep_output_identity_and_first_match_semantics() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut project = project_fixture(temp.path());
+    project.units = (0..2048)
+        .map(|index| unit(temp.path(), "shared.cpp", &format!("build/{index}.o")))
+        .collect();
+    let mut duplicate = project.units[0].clone();
+    duplicate.id = "duplicate-output".into();
+    project.units.push(duplicate);
+    let log: String = (0..2048)
+        .rev()
+        .map(|index| format!("0\t10\t1\t{index}.o\tcommand-{index}\n"))
+        .collect();
+    let actions = capture::parse_actions("", &log, &project, "");
+    assert_eq!(actions.len(), 2048);
+    for (action, unit) in actions.iter().zip(project.units[..2048].iter().rev()) {
+        assert_eq!(action.unit_id.as_deref(), Some(unit.id.as_str()));
+        assert_eq!(
+            action.outputs.as_slice(),
+            std::slice::from_ref(&unit.output)
+        );
+    }
+}
+
+#[test]
+fn decoder_writer_failure_retains_evidence_and_recovery_keeps_the_latest_unit_events() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut run = capture_fixture(temp.path());
+    run.status = "running".into();
+    run.finished_ms = None;
+    run.project
+        .units
+        .push(unit(temp.path(), "second.cpp", "build/second.o"));
+    let store = Store::open(&temp.path().join("store")).unwrap();
+    store.save(&run).unwrap();
+    let root = store.run_dir(&run.id).unwrap();
+    fs::create_dir_all(root.join("raw")).unwrap();
+    for (id, unit, detail, count) in [
+        ("000-first", &run.project.units[0], "first", 4000),
+        ("001-other", &run.project.units[1], "other", 1),
+        ("002-latest", &run.project.units[0], "latest", 1),
+    ] {
+        let invocation = Invocation {
+            id: id.into(),
+            directory: path_string(temp.path()),
+            arguments: unit.arguments.clone(),
+            response_files: BTreeMap::new(),
+            output: Some(unit.output.clone()),
+            family: "clang".into(),
+            exit_code: Some(0),
+            elapsed_ms: 10.0,
+            started_ms: Some(1000),
+            trace: Some(format!("raw/{id}.json")),
+            stderr: format!("raw/{id}.stderr"),
+            granularity_us: Some(0),
+            verbose: true,
+        };
+        let events: Vec<_> = (0..count)
+            .map(|index| {
+                json!({
+                    "name":"InstantiateFunction", "ph":"X", "ts":index*10, "dur":5,
+                    "pid":1, "tid":1, "args":{"detail":detail}
+                })
+            })
+            .collect();
+        write_json(
+            &root.join(invocation.trace.as_ref().unwrap()),
+            &json!({"traceEvents":events}),
+        )
+        .unwrap();
+        fs::write(root.join(&invocation.stderr), "").unwrap();
+        write_json(
+            &root.join("invocations").join(format!("{id}.json")),
+            &invocation,
+        )
+        .unwrap();
+    }
+    fs::write(root.join("invocations/003-incomplete.json"), "{").unwrap();
+    let mut unknown: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("invocations/001-other.json")).unwrap())
+            .unwrap();
+    unknown["output"] = json!("unknown-output.o");
+    write_json(&root.join("invocations/004-unknown.json"), &unknown).unwrap();
+    unknown["output"] = json!(run.project.units[1].output);
+    unknown["trace"] = json!("raw/missing.json");
+    write_json(&root.join("invocations/005-missing-trace.json"), &unknown).unwrap();
+
+    let database = rusqlite::Connection::open(store.root.join("index.sqlite3")).unwrap();
+    database
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_event BEFORE INSERT ON events WHEN NEW.unit='{}'
+         BEGIN SELECT RAISE(ABORT,'injected event failure'); END;",
+            run.project.units[1].id
+        ))
+        .unwrap();
+    assert!(
+        capture::recover(&store, &run.id)
+            .unwrap_err()
+            .to_string()
+            .contains("injected event failure")
+    );
+    assert_eq!(store.load(&run.id).unwrap().status, "running");
+    assert!(fs::read_dir(root.join("events")).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")
+    }));
+    for id in ["000-first", "001-other", "002-latest"] {
+        let invocation: Invocation = serde_json::from_slice(
+            &fs::read(root.join("invocations").join(format!("{id}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            root.join(invocation.trace.unwrap()).is_file(),
+            "{id} must remain decodable after a writer failure"
+        );
+    }
+    database.execute_batch("DROP TRIGGER fail_event").unwrap();
+
+    let recovered = capture::recover(&store, &run.id).unwrap();
+    assert_eq!(recovered.status, "interrupted");
+    assert_eq!(recovered.profiles.len(), 2);
+    assert_eq!(recovered.profiles[0].unit_id, run.project.units[0].id);
+    assert_eq!(recovered.profiles[0].templates[0].name, "latest");
+    assert_eq!(recovered.profiles[0].event_count, 1);
+    assert_eq!(recovered.profiles[1].unit_id, run.project.units[1].id);
+    assert_eq!(recovered.profiles[1].templates[0].name, "other");
+    assert!(
+        recovered
+            .notes
+            .iter()
+            .any(|note| note.contains("Multiple compiler invocations"))
+    );
+    assert!(
+        recovered
+            .notes
+            .iter()
+            .any(|note| note.contains("Incomplete invocation manifest"))
+    );
+    assert!(
+        recovered
+            .notes
+            .iter()
+            .any(|note| note.contains("not in the compilation inventory"))
+    );
+    assert!(
+        recovered
+            .notes
+            .iter()
+            .any(|note| note.contains("Detail unavailable"))
+    );
+    let page = store
+        .events(&run.id, &run.project.units[0].id, EventQuery::default())
+        .unwrap();
+    assert_eq!(page["total"], 1);
+    assert_eq!(page["events"][0]["detail"], "latest");
+    let bytes = zstd::stream::decode_all(
+        fs::File::open(
+            root.join("events")
+                .join(format!("{}.json.zst", run.project.units[0].id)),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let archived: Vec<TraceEvent> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(archived.len(), 1);
+    assert_eq!(archived[0].detail, "latest");
+    assert_eq!(fs::read_dir(root.join("events")).unwrap().count(), 2);
+}
+
+#[test]
 fn portable_archives_preserve_evidence_and_do_not_grant_local_source_access() {
     let temp = tempfile::tempdir().unwrap();
     let mut capture = capture_fixture(temp.path());

@@ -1,7 +1,7 @@
 //! Real command-line workflows against temporary CMake/Ninja projects. No tests
 //! edit the checked-in fixture, the editor application, or a user's build outputs.
 use buildscope::{
-    compiler,
+    capture, compiler,
     model::{Capture, Invocation},
     store::{EventQuery, Store},
 };
@@ -516,6 +516,160 @@ fn public_cmake_launcher_collects_parallel_incremental_and_failed_invocations() 
 }
 
 #[test]
+fn launcher_finalization_failure_preserves_recovery_and_retries_without_duplicate_reports() {
+    let Some(compiler) = clang() else {
+        return;
+    };
+    let fixture = Fixture::new(&compiler, &[]);
+    let launcher = format!(
+        "{};launch;--build-dir;{};--",
+        env!("CARGO_BIN_EXE_buildscope"),
+        fixture.build.display()
+    );
+    fixture.configure(
+        &compiler,
+        &[&format!("-DCMAKE_CXX_COMPILER_LAUNCHER={launcher}")],
+    );
+    assert!(normal_build(&fixture).status.success());
+    append(
+        &fixture.source.join("first.cpp"),
+        "\n// second invocation of the same unit\n",
+    );
+    assert!(normal_build(&fixture).status.success());
+    let pending = fixture.build.join(".buildscope-launcher/pending");
+    assert_eq!(fs::read_dir(&pending).unwrap().count(), 4);
+
+    let store = fixture.store();
+    let database = rusqlite::Connection::open(fixture.store_path.join("index.sqlite3")).unwrap();
+    // Fail after one receipt insert so final report rows AND partial receipts must roll back.
+    database
+        .execute_batch(
+            "CREATE TRIGGER fail_receipt BEFORE INSERT ON launcher_receipts
+        WHEN (SELECT count(*) FROM launcher_receipts WHERE run=NEW.run)=1
+        BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;",
+        )
+        .unwrap();
+
+    // Trace discovery through a subprocess-local PATH; other tests retain their real Ninja.
+    let native_path = std::env::var_os("PATH").unwrap();
+    let ninja = std::env::split_paths(&native_path)
+        .map(|directory| directory.join("ninja"))
+        .find(|path| path.is_file())
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    let wrappers = fixture.root.path().join("wrappers");
+    fs::create_dir(&wrappers).unwrap();
+    let wrapper = wrappers.join("ninja");
+    fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+for argument do
+    if [ "$argument" = graph ]; then
+        printf 'graph\n' >> "$BUILDSCOPE_TEST_GRAPH_LOG"
+    fi
+done
+exec "$BUILDSCOPE_TEST_NINJA" "$@"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let graph_log = fixture.root.path().join("graph.log");
+    let path =
+        std::env::join_paths(std::iter::once(wrappers).chain(std::env::split_paths(&native_path)))
+            .unwrap();
+    let failed = collect_launcher_command(&fixture, "retry-launcher")
+        .env("PATH", path)
+        .env("BUILDSCOPE_TEST_NINJA", ninja)
+        .env("BUILDSCOPE_TEST_GRAPH_LOG", &graph_log)
+        .output()
+        .unwrap();
+    assert!(!failed.status.success(), "{}", diagnostics(&failed));
+    assert!(diagnostics(&failed).contains("injected receipt failure"));
+    assert_eq!(fs::read_to_string(&graph_log).unwrap().lines().count(), 1);
+
+    let checkpoint = fixture.latest();
+    assert_eq!(checkpoint.status, "running");
+    assert_eq!(checkpoint.actions.len(), 4);
+    assert!(
+        checkpoint
+            .project
+            .rules
+            .values()
+            .any(|rule| rule.contains("LINKER"))
+    );
+    assert!(
+        checkpoint
+            .project
+            .rules
+            .values()
+            .any(|rule| rule.contains("CUSTOM_COMMAND"))
+    );
+    let rows = |table| {
+        database
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    assert!(
+        rows("events") > 0,
+        "decoding completed before finalization failed"
+    );
+    for table in [
+        "launcher_receipts",
+        "report_runs",
+        "report_units",
+        "profiles",
+        "headers",
+        "report_headers",
+        "include_paths",
+    ] {
+        assert_eq!(
+            rows(table),
+            0,
+            "{table} must not expose a partial finalization"
+        );
+    }
+    assert_eq!(fs::read_dir(&pending).unwrap().count(), 4);
+    database.execute_batch("DROP TRIGGER fail_receipt").unwrap();
+
+    let recovered = capture::recover(&store, &checkpoint.id).unwrap();
+    assert_eq!(recovered.status, "interrupted");
+    assert_eq!(recovered.profiles.len(), 3);
+    assert!(
+        recovered
+            .profiles
+            .iter()
+            .all(|profile| profile.event_count > 0)
+    );
+    assert!(
+        recovered
+            .notes
+            .iter()
+            .any(|note| note.contains("Multiple compiler invocations"))
+    );
+    assert_eq!(
+        rows("launcher_receipts"),
+        0,
+        "recovery must leave the spool unacknowledged"
+    );
+
+    let retried = collect_launcher(&fixture, "retry-launcher");
+    assert!(retried.status.success(), "{}", diagnostics(&retried));
+    let run = fixture.latest();
+    assert_eq!(run.id, checkpoint.id);
+    assert_eq!(run.status, "success");
+    assert_eq!(run.actions.len(), 4);
+    assert_eq!(run.profiles.len(), 3);
+    assert_eq!(store.list().unwrap().len(), 1);
+    assert_eq!(rows("launcher_receipts"), 4);
+    assert_eq!(rows("report_units"), 3);
+    assert_eq!(fs::read_dir(&pending).unwrap().count(), 0);
+    assert_eq!(store.overview(&run.id).unwrap()["status"], "success");
+}
+
+#[test]
 fn public_gcc_launcher_collects_native_timings_and_preserves_diagnostics() {
     let Some(compiler) = gcc() else {
         return;
@@ -714,14 +868,18 @@ fn normal_build(fixture: &Fixture) -> Output {
 }
 
 fn collect_launcher(fixture: &Fixture, label: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_buildscope"))
+    collect_launcher_command(fixture, label).output().unwrap()
+}
+
+fn collect_launcher_command(fixture: &Fixture, label: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_buildscope"));
+    command
         .arg("--store")
         .arg(&fixture.store_path)
         .args(["collect", "--build-dir"])
         .arg(&fixture.build)
-        .args(["--label", label])
-        .output()
-        .unwrap()
+        .args(["--label", label]);
+    command
 }
 
 struct Fixture {

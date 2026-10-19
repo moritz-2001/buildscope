@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::{Read, Write},
+    io::{BufReader, Read, Write},
     path::{Component, Path, PathBuf},
 };
 
@@ -17,6 +17,25 @@ use std::{
 pub struct Store {
     /// Absolute directory containing SQLite and immutable per-run artifacts.
     pub root: PathBuf,
+}
+
+/// A compressed event file prepared by a decoder, awaiting ordered publication.
+/// Each invocation owns its temporary file, even when several invocations share a unit.
+pub(crate) struct PreparedEvents {
+    /// Capture whose SQLite event rows will be replaced when this artifact is consumed.
+    run: String,
+    /// Unit whose events are published; repeated invocations replace it in input order.
+    unit: String,
+    /// Unique unpublished file, removed on drop after errors or abandoned worker results.
+    temporary: PathBuf,
+    /// Stable per-unit archive path; only the serial writer replaces this file.
+    destination: PathBuf,
+}
+
+impl Drop for PreparedEvents {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.temporary);
+    }
 }
 
 /// Search and pagination for one unit's compiler scopes.
@@ -128,7 +147,8 @@ impl Store {
         Ok(self.root.join("runs").join(id))
     }
 
-    /// Persist a local run, including a running manifest before execution begins.
+    /// Persist a local run, including its full recovery manifest before execution begins.
+    /// Running captures defer report indexing until finalization or an on-demand report read.
     pub fn save(&self, capture: &Capture) -> Result<()> {
         self.persist(capture, true, None)
     }
@@ -166,16 +186,22 @@ impl Store {
     /// Load only report summaries, omitting dependency matrices and named compiler detail.
     pub fn overview(&self, id: &str) -> Result<Value> {
         let id = self.resolve_id(id)?;
-        let connection = self.connection()?;
+        let mut connection = self.connection()?;
         let value = connection.query_row("SELECT data FROM report_runs WHERE id=?1", [&id], |r| {
             r.get::<_, String>(0)
         });
         let mut overview: Value = match value {
             Ok(value) => serde_json::from_str(&value)?,
             Err(rusqlite::Error::QueryReturnedNoRows) => {
+                // Serialize lazy indexing with finalization and reload under the writer
+                // lock so an old running manifest cannot overwrite a completed report.
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let capture = self.load(&id)?;
-                self.index_report(&connection, &capture)?;
-                report_overview(&capture)?
+                self.index_report(&transaction, &capture)?;
+                let overview = report_overview(&capture)?;
+                transaction.commit()?;
+                overview
             }
             Err(error) => return Err(error.into()),
         };
@@ -341,15 +367,43 @@ impl Store {
 
     /// Index normalized events and keep a compressed copy for independent archives.
     pub fn save_events(&self, run: &str, unit: &str, events: &[TraceEvent]) -> Result<()> {
+        self.save_prepared_events(self.prepare_events(run, unit, events)?, events)
+    }
+
+    /// Compress events independently of SQLite and other invocations of the same unit.
+    /// Dropping an unpublished result removes its temporary artifact.
+    pub(crate) fn prepare_events(
+        &self,
+        run: &str,
+        unit: &str,
+        events: &[TraceEvent],
+    ) -> Result<PreparedEvents> {
         validate_id(unit)?;
         let directory = self.run_dir(run)?.join("events");
         fs::create_dir_all(&directory)?;
-        let mut encoder = zstd::stream::write::Encoder::new(
-            File::create(directory.join(format!("{unit}.json.zst")))?,
-            3,
-        )?;
+        let prepared = PreparedEvents {
+            run: run.into(),
+            unit: unit.into(),
+            temporary: directory.join(format!(".{unit}.{}.tmp", unique_id())),
+            destination: directory.join(format!("{unit}.json.zst")),
+        };
+        let mut encoder = zstd::stream::write::Encoder::new(File::create(&prepared.temporary)?, 3)?;
         serde_json::to_writer(&mut encoder, events)?;
         encoder.finish()?;
+        Ok(prepared)
+    }
+
+    /// Publish a prepared event archive and replace its rows on the calling writer thread.
+    /// Archive publication precedes the transaction, as in `save_events`; an interrupted
+    /// index is rebuilt from retained invocation evidence during recovery.
+    pub(crate) fn save_prepared_events(
+        &self,
+        prepared: PreparedEvents,
+        events: &[TraceEvent],
+    ) -> Result<()> {
+        fs::rename(&prepared.temporary, &prepared.destination)?;
+        let run = &prepared.run;
+        let unit = &prepared.unit;
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         transaction.execute(
@@ -593,21 +647,27 @@ impl Store {
             params![capture.id, capture.started_ms as i64, capture.status, capture.kind, capture.project.configuration_id,
                 serde_json::to_string(&capture.targets)?, local, serde_json::to_string(capture)?])?;
         transaction.execute("DELETE FROM headers WHERE run=?1", [&capture.id])?;
-        for header in &capture.headers {
-            transaction.execute(
-                "INSERT INTO headers VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                params![
-                    capture.id,
-                    header.path,
-                    header.key,
-                    header.explicit_trigger,
-                    header.changed_contributor,
-                    header.rebuilt_units as i64,
-                    header.rebuilt_work_ms
-                ],
-            )?;
+        if capture.status == "running" {
+            // A retry can replace a previously queried/recovered capture. Invalidate its
+            // derived rows without rebuilding them; recovery reads the durable manifest.
+            self.clear_report(&transaction, &capture.id)?;
+        } else {
+            for header in &capture.headers {
+                transaction.execute(
+                    "INSERT INTO headers VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![
+                        capture.id,
+                        header.path,
+                        header.key,
+                        header.explicit_trigger,
+                        header.changed_contributor,
+                        header.rebuilt_units as i64,
+                        header.rebuilt_work_ms
+                    ],
+                )?;
+            }
+            self.index_report(&transaction, capture)?;
         }
-        self.index_report(&transaction, capture)?;
         if let Some((build, ids)) = receipts {
             for id in ids {
                 transaction.execute(
@@ -620,19 +680,25 @@ impl Store {
         Ok(())
     }
 
-    fn index_report(&self, connection: &Connection, capture: &Capture) -> Result<()> {
-        connection.execute(
-            "INSERT OR REPLACE INTO report_runs VALUES(?1,?2)",
-            params![capture.id, report_overview(capture)?.to_string()],
-        )?;
+    fn clear_report(&self, connection: &Connection, run: &str) -> Result<()> {
+        connection.execute("DELETE FROM report_runs WHERE id=?1", [run])?;
         for table in [
             "profiles",
             "report_units",
             "report_headers",
             "include_paths",
         ] {
-            connection.execute(&format!("DELETE FROM {table} WHERE run=?1"), [&capture.id])?;
+            connection.execute(&format!("DELETE FROM {table} WHERE run=?1"), [run])?;
         }
+        Ok(())
+    }
+
+    fn index_report(&self, connection: &Connection, capture: &Capture) -> Result<()> {
+        self.clear_report(connection, &capture.id)?;
+        connection.execute(
+            "INSERT OR REPLACE INTO report_runs VALUES(?1,?2)",
+            params![capture.id, report_overview(capture)?.to_string()],
+        )?;
         for unit in &capture.project.units {
             let mut detail = serde_json::to_value(unit)?;
             detail["execution_command"] = capture
@@ -734,7 +800,8 @@ impl Store {
                 .open(target)?;
             std::io::copy(&mut entry, &mut file)?;
         }
-        let capture: Capture = serde_json::from_reader(File::open(staging.join("capture.json"))?)?;
+        let capture: Capture =
+            serde_json::from_reader(BufReader::new(File::open(staging.join("capture.json"))?))?;
         ensure!(
             capture.schema_version == SCHEMA_VERSION,
             "unsupported archive version"
@@ -752,7 +819,7 @@ impl Store {
                 validate_id(unit)?;
                 let decoder = zstd::stream::read::Decoder::new(File::open(entry.path())?)?;
                 let events: Vec<TraceEvent> =
-                    serde_json::from_reader(decoder.take(1024 * 1024 * 1024))?;
+                    serde_json::from_reader(BufReader::new(decoder.take(1024 * 1024 * 1024)))?;
                 for (index, event) in events.iter().enumerate() {
                     ensure!(
                         event.id == index && event.parent.is_none_or(|parent| parent < index),
@@ -789,7 +856,7 @@ impl Store {
                 validate_id(unit)?;
                 let decoder = zstd::stream::read::Decoder::new(File::open(entry.path())?)?;
                 let events: Vec<TraceEvent> =
-                    serde_json::from_reader(decoder.take(1024 * 1024 * 1024))?;
+                    serde_json::from_reader(BufReader::new(decoder.take(1024 * 1024 * 1024)))?;
                 self.save_events(&capture.id, unit, &events)?;
             }
         }

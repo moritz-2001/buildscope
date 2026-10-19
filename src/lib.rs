@@ -12,3 +12,6 @@ pub mod project;
 pub mod report;
 pub mod store;
 pub mod util;
+
+mod decoder;
+mod worker_pool;

@@ -4,8 +4,9 @@ use crate::{analysis, capture, compiler, model::*, project, store::Store, util::
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs::{self, File, OpenOptions},
+    io::BufReader,
     os::{fd::AsRawFd, unix::process::ExitStatusExt},
     path::{Path, PathBuf},
     process::Command,
@@ -123,7 +124,8 @@ pub fn collect(store: &Store, build_dir: &Path, label: Option<String>) -> Result
             incomplete += 1;
             continue;
         }
-        let observation: Observation = serde_json::from_reader(File::open(marker)?)?;
+        let observation: Observation =
+            serde_json::from_reader(BufReader::new(File::open(marker)?))?;
         ensure!(
             observation.schema_version == SCHEMA_VERSION,
             "unsupported launcher schema"
@@ -182,6 +184,12 @@ pub fn collect(store: &Store, build_dir: &Path, label: Option<String>) -> Result
     let mut mismatches = BTreeSet::new();
     let mut environments = BTreeSet::new();
     let mut machines = BTreeSet::new();
+    // Own keys so replacing/appending units cannot invalidate this temporary index.
+    // Keep the first unit for an output, matching the inventory's previous lookup semantics.
+    let mut units_by_output = HashMap::with_capacity(inventory.units.len());
+    for (index, unit) in inventory.units.iter().enumerate() {
+        units_by_output.entry(unit.output.clone()).or_insert(index);
+    }
     for (directory, observation) in &observations {
         let invocation = &observation.invocation;
         inventory
@@ -193,16 +201,11 @@ pub fn collect(store: &Store, build_dir: &Path, label: Option<String>) -> Result
             .output
             .as_ref()
             .context("launcher output is missing")?;
+        let unit_index = units_by_output.get(output).copied();
         let source = observation
             .source
             .as_ref()
-            .or_else(|| {
-                inventory
-                    .units
-                    .iter()
-                    .find(|u| &u.output == output)
-                    .map(|u| &u.source)
-            })
+            .or_else(|| unit_index.map(|index| &inventory.units[index].source))
             .context("launcher source is missing")?
             .clone();
         let command_id = project::semantic_command(
@@ -215,7 +218,6 @@ pub fn collect(store: &Store, build_dir: &Path, label: Option<String>) -> Result
             .strip_prefix(&build)
             .map(path_string)
             .unwrap_or_else(|_| output.clone());
-        let unit_index = inventory.units.iter().position(|u| &u.output == output);
         if unit_index.is_none_or(|index| inventory.units[index].command_id != command_id) {
             mismatches.insert(format!("{output}:{command_id}"));
         }
@@ -245,6 +247,7 @@ pub fn collect(store: &Store, build_dir: &Path, label: Option<String>) -> Result
         if let Some(index) = unit_index {
             inventory.units[index] = unit;
         } else {
+            units_by_output.insert(output.clone(), inventory.units.len());
             inventory.units.push(unit);
         }
         let start = invocation
@@ -406,7 +409,7 @@ fn cached_compiler(executable: &str, directory: &Path, spool: &Path) -> Result<C
     fs::create_dir_all(&directory_path)?;
     let path = directory_path.join(format!("{key}.json"));
     if let Ok(file) = File::open(&path)
-        && let Ok(info) = serde_json::from_reader(file)
+        && let Ok(info) = serde_json::from_reader(BufReader::new(file))
     {
         return Ok(info);
     }

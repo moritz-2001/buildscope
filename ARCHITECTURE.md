@@ -12,7 +12,7 @@ CLI entry point. Browser assets are embedded in the binary.
 | Project inventory | [project.rs](src/project.rs) | CMake compilation database, Ninja dependencies/rules/graph, command identities, input snapshots |
 | Process effects | [capture.rs](src/capture.rs) | Ordinary builds, owned profiling trees, launcher artifacts, cancellation |
 | Public compiler launcher | [launcher.rs](src/launcher.rs) | Independent per-invocation spool, compiler identity cache, explicit batch collection |
-| Compiler decoding | [compiler.rs](src/compiler.rs) | Capability probes, Clang scopes, GCC timers, observed includes |
+| Compiler decoding | [compiler.rs](src/compiler.rs), [decoder.rs](src/decoder.rs) | Capability probes, Clang scopes, GCC timers, bounded invocation decoding and compression |
 | Shared vocabulary | [model.rs](src/model.rs) | Versioned captures and explicitly scoped observations |
 | Pure analysis | [analysis.rs](src/analysis.rs) | Header joins, findings, concurrency/dependency work, comparisons |
 | Persistence | [store.rs](src/store.rs) | SQLite indexes, compressed evidence, archive exchange, source preview |
@@ -23,6 +23,11 @@ per-process Invocation manifests. Compiler decoding produces
 CompilationProfile plus normalized TraceEvent records. Analysis derives
 HeaderSummary, Finding, and BuildSummary. The CLI and report consume the same
 model and analyses.
+
+[Project discovery](src/project.rs) executes Ninja's graph tool once and derives
+both prerequisite relations and native rule names from that DOT snapshot. Raw and
+response-expanded compilation databases remain separate because they preserve
+different command evidence.
 
 Collection owns mutable process/filesystem effects. Analyses operate on explicit
 observations and do not execute build commands. Compiler-specific vocabulary is
@@ -124,6 +129,39 @@ Spool cleanup follows that commit; a collector interrupted during cleanup skips
 receipted observations on retry. Deterministic batch IDs also allow retries of
 indexing interrupted before finalization. Raw observations are copied into the
 capture so archives retain their provenance.
+
+[Store persistence](src/store.rs) commits the complete running manifest for crash
+recovery without building report indexes. It invalidates derived rows from any
+earlier attempt; finalization rebuilds them in the same transaction as receipts.
+An explicit overview request can build indexes for a running checkpoint on demand.
+That lazy indexing holds a SQLite writer transaction and reloads the manifest under
+the lock, so it cannot publish a stale checkpoint over a completed capture or leave
+partial report rows after interruption. Recovery always reads the manifest,
+independently of those disposable indexes.
+
+JSON manifests and imported event streams use buffered readers. Temporary hash
+maps in [collection](src/launcher.rs) and [decoding](src/decoder.rs) index outputs
+and unit IDs while the vectors retain their deterministic order. Output indexes
+preserve first-match semantics; repeated invocation profiles replace the existing
+unit's profile in place, with all raw attempts retained.
+
+[Invocation decoding](src/decoder.rs) uses an [ordered worker pool](src/worker_pool.rs)
+shared by collection, profiling, and recovery. It uses at most four workers, limited
+by available CPUs and invocation count. Each worker owns one outstanding invocation;
+its next job is submitted only after the calling thread consumes its previous result.
+That bounds active decoders plus retained event vectors, even when the first trace
+is slow. The bound is by invocation count, not an absolute byte limit; one large
+trace can still need substantial memory.
+
+Workers decode and compress invocation-local traces and prepare normalized events
+in unique temporary files. Only the calling thread publishes per-unit event archives
+and writes SQLite, in sorted manifest order. This preserves profile order and the
+existing latest-decoded-invocation behavior when several invocations share a unit.
+On failure all workers are joined and unpublished event files are removed. Temporary
+files left by a process kill are never used as completed evidence. Raw compression
+publishes its updated invocation manifest before removing the original trace, so
+recovery can read either the old raw trace or its completed compressed replacement.
+Launcher receipts remain part of finalization, after decoding and indexing succeed.
 
 Launcher batches have no observed full-build boundary or dependency-chain work.
 The report labels their first-to-last compiler span separately from Ninja elapsed

@@ -162,8 +162,10 @@ pub fn discover(build_dir: &Path, targets: &[String]) -> Result<ProjectSnapshot>
     units.sort_by(|a, b| a.id.cmp(&b.id));
     units.dedup_by(|a, b| a.id == b.id);
     let dependencies = read_dependencies(&build)?;
-    let graph = read_graph(&build, targets)?;
-    let rules = read_rules(&build, targets)?;
+    let NinjaGraph {
+        dependencies: graph,
+        rules,
+    } = read_ninja_graph(&build, targets)?;
     let link_commands: Vec<_> = expanded_commands
         .iter()
         .filter(|(output, _)| {
@@ -375,57 +377,37 @@ pub fn parse_dependencies(text: &str, build: &Path) -> BTreeMap<String, Vec<Stri
 
 /// Read the target build graph, including command nodes with multiple outputs.
 pub fn read_graph(build: &Path, targets: &[String]) -> Result<BTreeMap<String, Vec<String>>> {
-    let output = checked(
-        Command::new("ninja")
-            .arg("-C")
-            .arg(build)
-            .args(["-t", "graph"])
-            .args(targets),
-    )?;
-    Ok(parse_graph(&String::from_utf8_lossy(&output.stdout), build))
-}
-
-fn read_rules(build: &Path, targets: &[String]) -> Result<BTreeMap<String, String>> {
-    let output = checked(
-        Command::new("ninja")
-            .arg("-C")
-            .arg(build)
-            .args(["-t", "graph"])
-            .args(targets),
-    )?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut names = BTreeMap::new();
-    let mut rules = BTreeSet::new();
-    let mut edges = Vec::new();
-    for line in text.lines() {
-        let quoted = quoted_strings(line);
-        if line.contains("->") && quoted.len() >= 2 {
-            edges.push((quoted[0].clone(), quoted[1].clone()));
-        } else if line.contains("label=") && quoted.len() >= 2 {
-            names.insert(quoted[0].clone(), quoted[1].clone());
-            if line.contains("shape=ellipse") {
-                rules.insert(quoted[0].clone());
-            }
-        }
-    }
-    Ok(edges
-        .into_iter()
-        .filter_map(|(from, to)| {
-            if !rules.contains(&from) {
-                return None;
-            }
-            Some((
-                path_string(resolve(build, names.get(&to)?)),
-                names.get(&from)?.clone(),
-            ))
-        })
-        .collect())
+    Ok(read_ninja_graph(build, targets)?.dependencies)
 }
 
 /// Collapse Ninja DOT rule vertices into file-to-prerequisite relations.
 pub fn parse_graph(text: &str, build: &Path) -> BTreeMap<String, Vec<String>> {
+    parse_ninja_graph(text, build).dependencies
+}
+
+/// Both views come from the same Ninja snapshot, avoiding another process and DOT parse.
+struct NinjaGraph {
+    dependencies: BTreeMap<String, Vec<String>>,
+    rules: BTreeMap<String, String>,
+}
+
+fn read_ninja_graph(build: &Path, targets: &[String]) -> Result<NinjaGraph> {
+    let output = checked(
+        Command::new("ninja")
+            .arg("-C")
+            .arg(build)
+            .args(["-t", "graph"])
+            .args(targets),
+    )?;
+    Ok(parse_ninja_graph(
+        &String::from_utf8_lossy(&output.stdout),
+        build,
+    ))
+}
+
+fn parse_ninja_graph(text: &str, build: &Path) -> NinjaGraph {
     let mut labels = BTreeMap::new();
-    let mut rules = BTreeSet::new();
+    let mut rule_nodes = BTreeSet::new();
     let mut incoming = BTreeMap::<String, Vec<String>>::new();
     for line in text.lines() {
         let quoted = quoted_strings(line);
@@ -437,18 +419,23 @@ pub fn parse_graph(text: &str, build: &Path) -> BTreeMap<String, Vec<String>> {
         } else if line.contains("label=") && quoted.len() >= 2 {
             labels.insert(quoted[0].clone(), quoted[1].clone());
             if line.contains("shape=ellipse") {
-                rules.insert(quoted[0].clone());
+                rule_nodes.insert(quoted[0].clone());
             }
         }
     }
     let mut graph = BTreeMap::new();
+    let mut rules = BTreeMap::new();
     for (node, label) in &labels {
-        if rules.contains(node) {
+        if rule_nodes.contains(node) {
             continue;
         }
+        let output = path_string(resolve(build, label));
         let mut dependencies = BTreeSet::new();
         for input in incoming.get(node).into_iter().flatten() {
-            if rules.contains(input) {
+            if rule_nodes.contains(input) {
+                if let Some(rule) = labels.get(input) {
+                    rules.insert(output.clone(), rule.clone());
+                }
                 for prerequisite in incoming.get(input).into_iter().flatten() {
                     if let Some(name) = labels.get(prerequisite) {
                         dependencies.insert(path_string(resolve(build, name)));
@@ -458,12 +445,12 @@ pub fn parse_graph(text: &str, build: &Path) -> BTreeMap<String, Vec<String>> {
                 dependencies.insert(path_string(resolve(build, name)));
             }
         }
-        graph.insert(
-            path_string(resolve(build, label)),
-            dependencies.into_iter().collect(),
-        );
+        graph.insert(output, dependencies.into_iter().collect());
     }
-    graph
+    NinjaGraph {
+        dependencies: graph,
+        rules,
+    }
 }
 
 /// Normalize output/dependency paths and managed instrumentation out of command identity.

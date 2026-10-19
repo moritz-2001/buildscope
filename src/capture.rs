@@ -1,11 +1,12 @@
 //! Ordinary Ninja recording, isolated profiling, and shared compiler execution.
 //! Managed builds persist captures before execution; public launchers own their spool.
+pub(crate) use crate::decoder::decode_invocations;
 use crate::{analysis, compiler, model::*, project, store::Store, util::*};
 use anyhow::{Context, Result, ensure};
 use std::{
     collections::{BTreeMap, HashMap},
     fs::{self, File},
-    io::{Read, Write},
+    io::{BufReader, Read, Write},
     os::unix::process::{CommandExt, ExitStatusExt},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
@@ -96,7 +97,8 @@ pub fn profile(store: &Store, request: &ProfileRequest) -> Result<(Capture, i32)
     let expected_owner =
         serde_json::json!({"source":original.source_dir,"original_build":original.build_dir});
     if owner.exists() {
-        let existing: serde_json::Value = serde_json::from_reader(File::open(&owner)?)?;
+        let existing: serde_json::Value =
+            serde_json::from_reader(BufReader::new(File::open(&owner)?))?;
         ensure!(
             existing == expected_owner,
             "profile directory belongs to a different project/build"
@@ -360,6 +362,10 @@ pub fn parse_actions(
     for line in before.lines() {
         *previous.entry(line).or_default() += 1;
     }
+    let mut units_by_output = HashMap::with_capacity(project.units.len());
+    for unit in &project.units {
+        units_by_output.entry(unit.output.as_str()).or_insert(unit);
+    }
     let mut actions = Vec::<BuildAction>::new();
     let build = Path::new(&project.build_dir);
     for line in after.lines().filter(|line| !line.starts_with('#')) {
@@ -375,7 +381,7 @@ pub fn parse_actions(
             continue;
         };
         let output = path_string(resolve(build, fields[3]));
-        let unit = project.units.iter().find(|u| u.output == output);
+        let unit = units_by_output.get(output.as_str()).copied();
         let same_execution = actions.last().is_some_and(|action| {
             action.start_ms == start as f64
                 && action.end_ms == end as f64
@@ -662,166 +668,6 @@ fn execute(
         capture.id
     );
     Ok((capture, code))
-}
-
-pub(crate) fn decode_invocations(
-    store: &Store,
-    capture: &mut Capture,
-    preprocess: bool,
-) -> Result<()> {
-    let root = store.run_dir(&capture.id)?;
-    let directory = root.join("invocations");
-    if !directory.exists() {
-        return Ok(());
-    }
-    capture.profiles.clear();
-    let mut entries: Vec<_> = fs::read_dir(directory)?.collect::<std::io::Result<_>>()?;
-    entries.sort_by_key(|e| e.file_name());
-    for entry in entries {
-        if entry.path().extension().and_then(|p| p.to_str()) != Some("json") {
-            continue;
-        }
-        let mut invocation: Invocation = match serde_json::from_reader(File::open(entry.path())?) {
-            Ok(value) => value,
-            Err(error) => {
-                capture
-                    .notes
-                    .push(format!("Incomplete invocation manifest: {error}"));
-                continue;
-            }
-        };
-        let Some(unit) = capture
-            .project
-            .units
-            .iter()
-            .find(|u| invocation.output.as_deref() == Some(&u.output))
-        else {
-            capture.notes.push(format!(
-                "Instrumented output was not in the compilation inventory: {:?}",
-                invocation.output
-            ));
-            continue;
-        };
-        match compiler::decode(&invocation, unit, &root) {
-            Ok((mut profile, events)) => {
-                if let Some(trace) = invocation
-                    .trace
-                    .clone()
-                    .filter(|path| !path.ends_with(".zst"))
-                {
-                    let compressed = format!("{trace}.zst");
-                    let result = (|| -> Result<()> {
-                        let mut input = File::open(root.join(&trace))?;
-                        let mut output = zstd::stream::write::Encoder::new(
-                            File::create(root.join(&compressed))?,
-                            3,
-                        )?;
-                        std::io::copy(&mut input, &mut output)?;
-                        output.finish()?;
-                        fs::remove_file(root.join(&trace))?;
-                        Ok(())
-                    })();
-                    match result {
-                        Ok(()) => {
-                            invocation.trace = Some(compressed.clone());
-                            profile.artifact = compressed;
-                            write_json(&entry.path(), &invocation)?;
-                        }
-                        Err(error) => profile
-                            .notes
-                            .push(format!("Raw trace compression unavailable: {error:#}")),
-                    }
-                }
-                if preprocess && invocation.exit_code == Some(0) {
-                    match preprocessing_metrics(&invocation, &root) {
-                        Ok(metrics) => profile.phases.extend(metrics),
-                        Err(error) => profile
-                            .notes
-                            .push(format!("Preprocessing probe unavailable: {error:#}")),
-                    }
-                }
-                store.save_events(&capture.id, &unit.id, &events)?;
-                if let Some(index) = capture
-                    .profiles
-                    .iter()
-                    .position(|p| p.unit_id == profile.unit_id)
-                {
-                    capture.notes.push(format!("Multiple compiler invocations for {}; named detail uses the latest decoded invocation. Raw evidence for all attempts is retained.",unit.source_key));
-                    capture.profiles[index] = profile;
-                } else {
-                    capture.profiles.push(profile);
-                }
-            }
-            Err(error) => capture.notes.push(format!(
-                "Detail unavailable for {}: {error:#}",
-                unit.source_key
-            )),
-        }
-    }
-    Ok(())
-}
-
-fn preprocessing_metrics(invocation: &Invocation, root: &Path) -> Result<Vec<Metric>> {
-    let output = root.join("raw").join(format!("{}.ii", invocation.id));
-    let mut arguments = Vec::new();
-    let mut skip = false;
-    let (expanded, _) = project::expand_responses(
-        &invocation.arguments,
-        Path::new(&invocation.directory),
-        &invocation.response_files,
-    )?;
-    for arg in &expanded[1..] {
-        if skip {
-            skip = false;
-            continue;
-        }
-        if ["-o", "-MF", "-MT", "-MQ"].contains(&arg.as_str()) {
-            skip = true;
-            continue;
-        }
-        if ["-c", "-MD", "-MMD", "-MP", "-H"].contains(&arg.as_str())
-            || arg.starts_with("-ftime-")
-            || arg.starts_with("-fdiagnostics-format=")
-            || arg.starts_with("-fmodule-output=")
-        {
-            continue;
-        }
-        arguments.push(arg.clone());
-    }
-    let result = Command::new(&invocation.arguments[0])
-        .args(arguments)
-        .args(["-E", "-o"])
-        .arg(&output)
-        .current_dir(&invocation.directory)
-        .output()?;
-    ensure!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    let bytes = fs::read(&output)?;
-    let count = bytes.iter().filter(|&&b| b == b'\n').count();
-    let mut compressed =
-        zstd::stream::write::Encoder::new(File::create(output.with_extension("ii.zst"))?, 3)?;
-    compressed.write_all(&bytes)?;
-    compressed.finish()?;
-    fs::remove_file(output)?;
-    Ok(vec![
-        Metric {
-            name: "Preprocessed output size".into(),
-            value: bytes.len() as f64,
-            unit: "bytes".into(),
-            origin: "measured".into(),
-            coverage: "separate preprocessing run; size is not parsing difficulty".into(),
-        },
-        Metric {
-            name: "Preprocessed output lines".into(),
-            value: count as f64,
-            unit: "count".into(),
-            origin: "measured".into(),
-            coverage: "includes line directives; not a token count".into(),
-        },
-    ])
 }
 
 fn copy_cache_key(key: &str, cache: &BTreeMap<String, String>) -> bool {
