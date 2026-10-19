@@ -183,6 +183,348 @@ fn template_families_preserve_spellings_work_and_every_sorted_page() {
 }
 
 #[test]
+fn compiler_work_filters_and_drilldowns_share_totals_pages_and_original_events() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let store = Store::open(&root.join("store")).unwrap();
+    let mut capture = capture_fixture(root);
+    capture.kind = "profile".into();
+    capture.project.units = vec![
+        unit(root, "first.cpp", "build/CMakeFiles/app.dir/first.o"),
+        unit(root, "second.cpp", "build/CMakeFiles/tests.dir/second.o"),
+        unit(root, "other.cpp", "build/CMakeFiles/app.dir/other.o"),
+        unit(
+            root,
+            "unprofiled.cpp",
+            "build/CMakeFiles/app.dir/unprofiled.o",
+        ),
+    ];
+    capture
+        .project
+        .compilers
+        .push(capture.project.compilers[0].clone());
+    capture.project.units[2].compiler = 1;
+    let scope = |name: &str, detail: &str, ms: f64, line: Option<u64>| TraceEvent {
+        id: 0,
+        name: name.into(),
+        detail: detail.into(),
+        thread: "1".into(),
+        start_us: 0.0,
+        duration_us: ms * 1000.0,
+        file: line.map(|_| "header.hpp".into()),
+        line,
+        parent: None,
+        depth: 0,
+    };
+    let mut evidence = vec![
+        vec![
+            scope("InstantiateFunction", "Entity<int>", 10.0, Some(7)),
+            scope("InstantiateFunction", "Entity<int>", 20.0, Some(7)),
+            scope("InstantiateFunction", "Entity<float>", 5.0, Some(9)),
+            scope("OptFunction", "work<int>", 4.0, Some(3)),
+            scope("CodeGen Function", "work<int>", 1.0, Some(3)),
+            scope("EvaluateAsRValue", "100%_ready", 2.0, None),
+            scope("Frontend", "unrelated work", 1000.0, None),
+        ],
+        vec![
+            scope("InstantiateFunction", "Entity<int>", 40.0, Some(7)),
+            scope("InstantiateFunction", "Entity<float>", 7.0, Some(9)),
+            scope("OptFunction", "work<int>", 6.0, Some(3)),
+            scope("EvaluateAsRValue", "", 3.0, None),
+            scope("isIntegerConstantExpr", "", 2.0, None),
+        ],
+        vec![scope("InstantiateFunction", "Entity<int>", 70.0, None)],
+        // Indexed events without a profile must not become named-scope evidence.
+        vec![scope("InstantiateFunction", "Entity<int>", 999.0, Some(7))],
+    ];
+    for (index, (unit, events)) in capture.project.units.iter().zip(&mut evidence).enumerate() {
+        for (id, event) in events.iter_mut().enumerate() {
+            event.id = id;
+            event.start_us = id as f64 * 1000.0;
+        }
+        store.save_events(&capture.id, &unit.id, events).unwrap();
+        if index < 3 {
+            capture.profiles.push(CompilationProfile {
+                unit_id: unit.id.clone(),
+                family: "clang".into(),
+                event_count: events.len(),
+                granularity_us: Some(500),
+                ..CompilationProfile::default()
+            });
+        }
+    }
+    store.save(&capture).unwrap();
+    let mut unrelated = capture.clone();
+    unrelated.id = "different-run".into();
+    store.save(&unrelated).unwrap();
+    store
+        .save_events(
+            &unrelated.id,
+            &unrelated.project.units[0].id,
+            &[scope("InstantiateFunction", "Entity<int>", 9999.0, Some(7))],
+        )
+        .unwrap();
+
+    for (category, target, compiler, activity, text, families, total, work) in [
+        ("templates", "", None, "", "", false, 3, 152.0),
+        ("templates", "", None, "", "", true, 2, 152.0),
+        (
+            "templates",
+            "app",
+            Some(0),
+            "InstantiateFunction",
+            "HEADER.HPP",
+            true,
+            1,
+            35.0,
+        ),
+        (
+            "templates",
+            "tests",
+            Some(0),
+            "InstantiateFunction",
+            "Entity<int>",
+            false,
+            1,
+            40.0,
+        ),
+        ("templates", "app", Some(1), "", "", false, 1, 70.0),
+        (
+            "templates",
+            "",
+            Some(0),
+            "",
+            "ENTITY<FLOAT>",
+            false,
+            1,
+            12.0,
+        ),
+        ("templates", "", None, "", "header.hpp", false, 2, 82.0),
+        ("templates", "", Some(99), "", "", true, 0, 0.0),
+        ("templates", "missing", None, "", "", false, 0, 0.0),
+        ("templates", "", None, "OptFunction", "", false, 0, 0.0),
+        ("templates", "", None, "", "' OR 1=1 --", false, 0, 0.0),
+        ("functions", "", Some(0), "", "", false, 2, 11.0),
+        (
+            "functions",
+            "tests",
+            Some(0),
+            "OptFunction",
+            "work<int>",
+            false,
+            1,
+            6.0,
+        ),
+        (
+            "functions",
+            "app",
+            Some(0),
+            "CodeGen Function",
+            "header.hpp",
+            true,
+            1,
+            1.0,
+        ),
+        ("evaluations", "", None, "", "", false, 3, 7.0),
+        (
+            "evaluations",
+            "app",
+            Some(0),
+            "EvaluateAsRValue",
+            "%_",
+            false,
+            1,
+            2.0,
+        ),
+    ] {
+        let query = || CompilerWorkQuery {
+            category,
+            target,
+            compiler,
+            activity,
+            text,
+            families,
+            limit: 200,
+            ..CompilerWorkQuery::default()
+        };
+        let ranking = store.compiler_work(&capture.id, query()).unwrap();
+        assert_eq!(
+            ranking["total"], total,
+            "{category}/{target}/{text}/{families}"
+        );
+        assert_eq!(ranking["summary"]["work_ms"], work);
+        let beyond = store
+            .compiler_work(
+                &capture.id,
+                CompilerWorkQuery {
+                    offset: usize::MAX,
+                    ..query()
+                },
+            )
+            .unwrap();
+        assert!(beyond["rows"].as_array().unwrap().is_empty());
+        assert_eq!(beyond["summary"], ranking["summary"]);
+        assert_eq!(beyond["coverage"], ranking["coverage"]);
+
+        for entity in ranking["rows"].as_array().unwrap() {
+            let key = entity["key"].as_str().unwrap();
+            for breakdown in ["members", "units", "events"] {
+                let detail = || CompilerWorkQuery {
+                    entity: key,
+                    breakdown,
+                    ..query()
+                };
+                let all = store.compiler_work(&capture.id, detail()).unwrap();
+                let rows = all["rows"].as_array().unwrap();
+                assert_eq!(all["summary"]["work_ms"], entity["work_ms"]);
+                assert_eq!(all["coverage"], ranking["coverage"]);
+                assert_eq!(
+                    rows.iter()
+                        .map(|r| r["count"].as_u64().unwrap())
+                        .sum::<u64>(),
+                    entity["count"].as_u64().unwrap()
+                );
+                for offset in 0..=rows.len() {
+                    let page = store
+                        .compiler_work(
+                            &capture.id,
+                            CompilerWorkQuery {
+                                offset,
+                                limit: 1,
+                                ..detail()
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(page["total"], all["total"]);
+                    assert_eq!(page["summary"], all["summary"]);
+                    assert_eq!(
+                        page["rows"],
+                        json!(rows[offset..(offset + 1).min(rows.len())])
+                    );
+                }
+                if breakdown == "events" {
+                    for row in rows {
+                        let index = capture
+                            .project
+                            .units
+                            .iter()
+                            .position(|u| Some(u.id.as_str()) == row["unit_id"].as_str())
+                            .unwrap();
+                        let original =
+                            &evidence[index][row["event"]["id"].as_u64().unwrap() as usize];
+                        assert_eq!(row["event"], serde_json::to_value(original).unwrap());
+                    }
+                } else if breakdown == "units" {
+                    assert_eq!(rows.len() as u64, entity["units"].as_u64().unwrap());
+                    for contribution in rows {
+                        let unit = contribution["unit_id"].as_str().unwrap();
+                        let scopes = store
+                            .compiler_work(
+                                &capture.id,
+                                CompilerWorkQuery {
+                                    entity: key,
+                                    breakdown: "events",
+                                    unit,
+                                    ..query()
+                                },
+                            )
+                            .unwrap();
+                        assert_eq!(scopes["total"], contribution["count"]);
+                        assert_eq!(scopes["summary"]["work_ms"], contribution["work_ms"]);
+                        assert!(
+                            scopes["rows"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .all(|r| r["unit_id"] == unit)
+                        );
+                    }
+                }
+            }
+            let absent_unit = store
+                .compiler_work(
+                    &capture.id,
+                    CompilerWorkQuery {
+                        entity: key,
+                        breakdown: "events",
+                        unit: "absent",
+                        ..query()
+                    },
+                )
+                .unwrap();
+            assert_eq!(absent_unit["total"], 0);
+            assert_eq!(absent_unit["summary"]["work_ms"], 0.0);
+        }
+    }
+
+    let unit_ranking = store
+        .compiler_work(
+            &capture.id,
+            CompilerWorkQuery {
+                unit: &capture.project.units[0].id,
+                ..CompilerWorkQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(unit_ranking["total"], 2);
+    assert_eq!(unit_ranking["summary"]["work_ms"], 35.0);
+    let empty_selection = store
+        .compiler_work(
+            &capture.id,
+            CompilerWorkQuery {
+                unit: &capture.project.units[0].id,
+                compiler: Some(1),
+                limit: 0,
+                offset: usize::MAX,
+                ..CompilerWorkQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(empty_selection["total"], 0);
+    assert_eq!(empty_selection["limit"], 1);
+    assert_eq!(empty_selection["offset"], i64::MAX as usize);
+    assert_eq!(empty_selection["summary"]["work_ms"], 0.0);
+
+    // Decoding an opaque key may narrow the index search but must never replace
+    // the canonical comparison: alternate JSON formatting remains a non-match.
+    let ranking = store
+        .compiler_work(&capture.id, CompilerWorkQuery::default())
+        .unwrap();
+    let canonical: serde_json::Value =
+        serde_json::from_str(ranking["rows"][0]["key"].as_str().unwrap()).unwrap();
+    let pretty = serde_json::to_string_pretty(&canonical).unwrap();
+    for key in [
+        pretty.as_str(),
+        "not-json",
+        "[]",
+        "{}",
+        "null",
+        "[0,3,4,null,null]",
+    ] {
+        for breakdown in ["members", "units", "events"] {
+            let result = store
+                .compiler_work(
+                    &capture.id,
+                    CompilerWorkQuery {
+                        entity: key,
+                        breakdown,
+                        ..CompilerWorkQuery::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(result["total"], 0);
+            assert_eq!(result["summary"]["work_ms"], 0.0);
+            assert!(result["rows"].as_array().unwrap().is_empty());
+        }
+    }
+    let absent_run = store
+        .compiler_work("absent", CompilerWorkQuery::default())
+        .unwrap();
+    assert_eq!(absent_run["total"], 0);
+    assert_eq!(absent_run["coverage"], json!([]));
+}
+
+#[test]
 fn global_compiler_work_sums_units_and_preserves_evidence_boundaries() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
@@ -271,6 +613,78 @@ fn global_compiler_work_sums_units_and_preserves_evidence_boundaries() {
             .unwrap();
     }
     store.save(&capture).unwrap();
+    let legacy_root = root.join("legacy");
+    fs::create_dir(&legacy_root).unwrap();
+    let legacy = rusqlite::Connection::open(legacy_root.join("index.sqlite3")).unwrap();
+    legacy
+        .execute_batch(include_str!("fixtures/store-v1.sql"))
+        .unwrap();
+    legacy
+        .execute(
+            "ATTACH DATABASE ?1 AS indexed",
+            [store.root.join("index.sqlite3").to_str().unwrap()],
+        )
+        .unwrap();
+    for (table, columns) in [
+        ("runs", "*"),
+        ("launcher_receipts", "*"),
+        ("events", "run,unit,idx,name,detail,start,duration,data"),
+        ("headers", "*"),
+        ("report_runs", "*"),
+        ("profiles", "run,unit,data"),
+        ("report_units", "run,unit,data"),
+        ("report_headers", "*"),
+        ("include_paths", "*"),
+    ] {
+        legacy
+            .execute(
+                &format!("INSERT INTO {table} SELECT {columns} FROM indexed.{table}"),
+                [],
+            )
+            .unwrap();
+    }
+    drop(legacy);
+    let migrated = Store::open(&legacy_root).unwrap();
+    assert_eq!(
+        serde_json::to_value(migrated.load(&capture.id).unwrap()).unwrap(),
+        serde_json::to_value(&capture).unwrap()
+    );
+    // Fresh writes and v1 backfills must expose identical rankings, keys, totals,
+    // and drill-downs across every category and target/identity boundary.
+    for category in ["templates", "functions", "evaluations"] {
+        for target in ["", "app", "tests", "(other)"] {
+            for compiler in [None, Some(0), Some(1), Some(2)] {
+                for families in [false, true] {
+                    let request = || CompilerWorkQuery {
+                        category,
+                        target,
+                        compiler,
+                        families,
+                        limit: 2,
+                        ..CompilerWorkQuery::default()
+                    };
+                    let fresh = store.compiler_work(&capture.id, request()).unwrap();
+                    assert_eq!(
+                        migrated.compiler_work(&capture.id, request()).unwrap(),
+                        fresh
+                    );
+                    for entity in fresh["rows"].as_array().unwrap() {
+                        for breakdown in ["units", "members", "events"] {
+                            let detail = || CompilerWorkQuery {
+                                entity: entity["key"].as_str().unwrap(),
+                                breakdown,
+                                ..request()
+                            };
+                            assert_eq!(
+                                migrated.compiler_work(&capture.id, detail()).unwrap(),
+                                store.compiler_work(&capture.id, detail()).unwrap()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
     let query = || CompilerWorkQuery {
         compiler: Some(0),
         ..CompilerWorkQuery::default()
@@ -502,6 +916,75 @@ fn global_compiler_work_sums_units_and_preserves_evidence_boundaries() {
     assert_eq!(
         imported.compiler_work(&capture.id, query()).unwrap()["rows"],
         replaced["rows"]
+    );
+}
+
+#[test]
+fn profile_replacement_and_lazy_reports_replace_typed_phases_with_original_json() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(&temp.path().join("store")).unwrap();
+    let mut capture = capture_fixture(temp.path());
+    let unit = capture.project.units[0].id.clone();
+    capture.profiles = vec![CompilationProfile {
+        unit_id: unit,
+        family: "gcc".into(),
+        phases: vec![Metric {
+            name: "template instantiation".into(),
+            value: 10.0,
+            unit: "ms".into(),
+            origin: "measured".into(),
+            coverage: "complete".into(),
+        }],
+        ..CompilationProfile::default()
+    }];
+    store.save(&capture).unwrap();
+    assert_eq!(
+        store
+            .compiler_work(&capture.id, CompilerWorkQuery::default())
+            .unwrap()["timers"][0]["work_ms"],
+        10.0
+    );
+    capture.profiles[0].phases[0].value = 3.0;
+    store.save(&capture).unwrap();
+    assert_eq!(
+        store
+            .compiler_work(&capture.id, CompilerWorkQuery::default())
+            .unwrap()["timers"][0]["work_ms"],
+        3.0
+    );
+    let database = rusqlite::Connection::open(store.root.join("index.sqlite3")).unwrap();
+    let original: String = database
+        .query_row("SELECT data FROM profiles", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        original,
+        serde_json::to_string(&capture.profiles[0]).unwrap()
+    );
+    capture.status = "running".into();
+    store.save(&capture).unwrap();
+    assert_eq!(
+        database
+            .query_row("SELECT count(*) FROM profile_phases", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    store.overview(&capture.id).unwrap();
+    assert_eq!(
+        store
+            .compiler_work(&capture.id, CompilerWorkQuery::default())
+            .unwrap()["timers"][0]["work_ms"],
+        3.0
+    );
+    capture.status = "success".into();
+    capture.profiles.clear();
+    store.save(&capture).unwrap();
+    assert_eq!(
+        database
+            .query_row("SELECT count(*) FROM profile_phases", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
     );
 }
 

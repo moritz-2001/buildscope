@@ -205,6 +205,12 @@ trace events, and original-command views.
 
 Events can be searched, filtered by activity, ordered by duration or time, and
 paged through the SQLite index.
+Existing databases upgrade automatically on first open. Search and aggregation
+fields are stored in typed columns alongside the original, unchanged JSON
+payloads. Upgrades are transactional; large stores may take longer to open once.
+Concurrent openers wait for the upgrade to finish. Migration stages and periodic
+processed-row counts are printed to stderr until the journal has finished flushing.
+Portable capture and archive formats remain compatible.
 Selecting a scope opens its immediate recorded children and containing scope.
 
 Approximate template-family grouping is a display operation. Exact compiler

@@ -273,6 +273,39 @@ unit details, and report summaries. Raw Clang traces and normalized events are
 Zstandard-compressed in per-run directories. Optional preprocessing output is
 also compressed. JSON manifests are replaced atomically.
 
+[store/schema.rs](src/store/schema.rs) owns database version 2 independently of
+portable capture/archive schema 1. `Store::open` initializes fresh stores or
+migrates legacy versions 0/1 under an immediate transaction, rereading the version
+after acquiring the writer lock. Unit/profile metadata is copied into required
+typed columns; optional event file/line fields are backfilled in bounded keyset
+batches. `profile_phases` stores each native metric with its original ordinal,
+unit, provenance, and coverage, preserving duplicate names. Migration copies
+unit/profile JSON strings verbatim and never updates event JSON, manifests, or
+report detail payloads. Invalid metadata aborts the entire upgrade with the row
+identity; reopening retries after repair. Newer database versions are rejected.
+Version-zero databases must match the known legacy layout before upgrading.
+
+Normal report indexing writes typed projections and the existing full JSON in
+one transaction. Report replacement and lazy indexing clear phases with their
+profiles; event replacement writes nullable locations with the original event
+payload. Before publishing an event archive, the serial writer validates every
+source line in its batch against SQLite's integer range. A rejected batch leaves
+the previous compressed JSON and database rows unchanged; its temporary archive
+is removed on drop. Query fields are derived indexes: retained JSON is the backup
+source for rebuilding them and remains the source for full detail responses. Archive
+formats and raw artifact files are unchanged; importing rebuilds the latest
+projections. First opening a large legacy database performs a one-time backfill
+and holds the writer lock until it commits. Initialization connections retry
+SQLite BUSY locks without a deadline, including journal-mode setup, so concurrent
+openers wait through long upgrades and reread the version under the writer lock.
+Only startup connections use this policy; normal query/write connections retain
+their ten-second timeout, and errors other than BUSY still propagate.
+Legacy upgrades log their stages to stderr, with a two-second heartbeat during
+lock waits, SQLite scans, backfill,
+commit, and journal flushing. Backfill reports processed row counts without an
+extra table-count scan. Completion is logged after the connection closes so a
+large journal checkpoint stays visible. Fresh and current stores stay quiet.
+
 Report summaries omit raw events, named-symbol arrays, full command arguments,
 and dependency matrices. Unit/header detail is loaded through indexed queries.
 Trace search is paginated and capped, with a parent index supporting nested-scope
@@ -281,8 +314,26 @@ inspection. Browser tables page independently of the complete capture.
 Global compiler work uses [store/compiler_work.rs](src/store/compiler_work.rs).
 `Store::compiler_work` takes a `CompilerWorkQuery` and serves bounded pages from
 `/api/compiler-work`. A partial index over relevant normalized `events` supports
-existing captures without re-profiling or a manifest-schema change. Compiler,
-target, activity, and literal spelling/path filters precede aggregation. The key
+existing captures without re-profiling or a manifest-schema change. Queries use
+typed unit/profile metadata, stored event locations, and `profile_phases` rather
+than extracting fields from JSON. Each request copies the target-scoped typed
+inventory into a connection-local temporary table keyed by unit. Literal category
+predicates use the existing partial event index, and an event-first join looks up
+that small inventory instead of walking unrelated activities in each unit. Restricted
+unit selections are checked against the event index before spelling/path searches
+read event payloads; empty eligible inventories return coverage/timers directly. Target
+equality uses the `(run,target,unit)` index when populating the inventory; target
+derivation runs once during indexing/backfill. Exact-entity drill-downs additionally
+seek by native activity and spelling when available, while the canonical opaque
+key comparison retains exact source variants and rejects malformed keys.
+
+The filtered ranking, members, unit contributions, or event rows are materialized
+once into a second temporary table. Both totals and the sorted page read that
+result, including empty and out-of-range pages. Both temporary tables belong to
+the short-lived query connection and disappear on success or error; they require
+no persistent schema migration and share the existing read transaction with
+coverage and GCC timers.
+Compiler, target, activity, and literal spelling/path filters precede aggregation. The key
 preserves compiler index, native activity, exact detail, and supplied file/line;
 missing metadata stays missing. Family grouping uses a deterministic approximate
 SQLite display function and never becomes semantic specialization identity. The

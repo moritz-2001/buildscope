@@ -12,6 +12,7 @@ use std::{
 };
 
 mod compiler_work;
+mod schema;
 pub use compiler_work::CompilerWorkQuery;
 
 /// A local capture repository. Connections are short-lived so reports can read while
@@ -75,47 +76,7 @@ impl Store {
             root: root.canonicalize()?,
         };
         fs::create_dir_all(store.root.join("runs"))?;
-        let connection = store.connection()?;
-        let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        ensure!(
-            version <= SCHEMA_VERSION,
-            "this database requires a newer Buildscope"
-        );
-        connection.execute_batch("
-            PRAGMA journal_mode=WAL;
-            CREATE TABLE IF NOT EXISTS runs(
-                id TEXT PRIMARY KEY, started INTEGER NOT NULL, status TEXT NOT NULL,
-                kind TEXT NOT NULL, configuration TEXT NOT NULL, targets TEXT NOT NULL,
-                local INTEGER NOT NULL, manifest TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS launcher_receipts(build TEXT NOT NULL,invocation TEXT NOT NULL,run TEXT NOT NULL,
-                PRIMARY KEY(build,invocation));
-            CREATE INDEX IF NOT EXISTS run_history ON runs(configuration, kind, started);
-            CREATE TABLE IF NOT EXISTS events(
-                run TEXT NOT NULL, unit TEXT NOT NULL, idx INTEGER NOT NULL,
-                name TEXT NOT NULL, detail TEXT NOT NULL, start REAL NOT NULL,
-                duration REAL NOT NULL, data TEXT NOT NULL,
-                PRIMARY KEY(run,unit,idx));
-            CREATE INDEX IF NOT EXISTS event_query ON events(run,unit,duration DESC);
-            CREATE INDEX IF NOT EXISTS compiler_work_query ON events(run,name,detail,unit)
-                WHERE name IN ('InstantiateClass','InstantiateFunction','OptFunction','CodeGen Function','isIntegerConstantExpr')
-                    OR name GLOB 'Evaluate*';
-            CREATE TABLE IF NOT EXISTS headers(
-                run TEXT NOT NULL, path TEXT NOT NULL, key TEXT NOT NULL,
-                trigger INTEGER NOT NULL, contributor INTEGER NOT NULL,
-                rebuilt INTEGER NOT NULL, work REAL NOT NULL,
-                PRIMARY KEY(run,path));
-            CREATE INDEX IF NOT EXISTS header_history ON headers(key,run);
-            CREATE TABLE IF NOT EXISTS report_runs(id TEXT PRIMARY KEY,data TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS profiles(run TEXT NOT NULL,unit TEXT NOT NULL,data TEXT NOT NULL,
-                PRIMARY KEY(run,unit));
-            CREATE TABLE IF NOT EXISTS report_units(run TEXT NOT NULL,unit TEXT NOT NULL,data TEXT NOT NULL,
-                PRIMARY KEY(run,unit));
-            CREATE TABLE IF NOT EXISTS report_headers(run TEXT NOT NULL,path TEXT NOT NULL,data TEXT NOT NULL,
-                PRIMARY KEY(run,path));
-            CREATE TABLE IF NOT EXISTS include_paths(run TEXT NOT NULL,path TEXT NOT NULL,
-                chain TEXT NOT NULL,unit TEXT NOT NULL,PRIMARY KEY(run,path,chain,unit));
-            CREATE INDEX IF NOT EXISTS event_parent ON events(run,unit,json_extract(data,'$.parent'));
-            PRAGMA user_version=1;")?;
+        schema::initialize(store.connection()?)?;
         Ok(store)
     }
 
@@ -410,6 +371,14 @@ impl Store {
         prepared: PreparedEvents,
         events: &[TraceEvent],
     ) -> Result<()> {
+        // Check the entire batch before publishing its JSON archive. Otherwise a
+        // later invalid location could reject the index after replacing its backup.
+        ensure!(
+            events
+                .iter()
+                .all(|event| event.line.is_none_or(|line| line <= i64::MAX as u64)),
+            "event line exceeds SQLite integer range"
+        );
         fs::rename(&prepared.temporary, &prepared.destination)?;
         let run = &prepared.run;
         let unit = &prepared.unit;
@@ -420,8 +389,10 @@ impl Store {
             params![run, unit],
         )?;
         {
-            let mut insert =
-                transaction.prepare("INSERT INTO events VALUES(?1,?2,?3,?4,?5,?6,?7,?8)")?;
+            let mut insert = transaction.prepare(
+                "INSERT INTO events(run,unit,idx,name,detail,start,duration,data,file,line)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            )?;
             for event in events {
                 insert.execute(params![
                     run,
@@ -431,7 +402,13 @@ impl Store {
                     event.detail,
                     event.start_us,
                     event.duration_us,
-                    serde_json::to_string(event)?
+                    serde_json::to_string(event)?,
+                    event.file,
+                    event
+                        .line
+                        .map(i64::try_from)
+                        .transpose()
+                        .context("event line exceeds SQLite integer range")?
                 ])?;
             }
         }
@@ -692,6 +669,7 @@ impl Store {
     fn clear_report(&self, connection: &Connection, run: &str) -> Result<()> {
         connection.execute("DELETE FROM report_runs WHERE id=?1", [run])?;
         for table in [
+            "profile_phases",
             "profiles",
             "report_units",
             "report_headers",
@@ -733,15 +711,39 @@ impl Store {
                 .unwrap_or_default();
             detail["response_files"] = serde_json::to_value(responses)?;
             connection.execute(
-                "INSERT INTO report_units VALUES(?1,?2,?3)",
-                params![capture.id, unit.id, detail.to_string()],
+                "INSERT INTO report_units(run,unit,data,source_key,output_key,compiler,target)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    capture.id,
+                    unit.id,
+                    detail.to_string(),
+                    unit.source_key,
+                    unit.output_key,
+                    i64::try_from(unit.compiler)
+                        .context("compiler index exceeds SQLite integer range")?,
+                    schema::target_for(&unit.output_key)
+                ],
             )?;
         }
         for profile in &capture.profiles {
             connection.execute(
-                "INSERT INTO profiles VALUES(?1,?2,?3)",
-                params![capture.id, profile.unit_id, serde_json::to_string(profile)?],
+                "INSERT INTO profiles(run,unit,data,family,event_count,granularity_us)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    capture.id,
+                    profile.unit_id,
+                    serde_json::to_string(profile)?,
+                    profile.family,
+                    i64::try_from(profile.event_count)
+                        .context("event count exceeds SQLite integer range")?,
+                    profile
+                        .granularity_us
+                        .map(i64::try_from)
+                        .transpose()
+                        .context("granularity exceeds SQLite integer range")?
+                ],
             )?;
+            schema::index_phases(connection, &capture.id, &profile.unit_id, &profile.phases)?;
             let mut chain = Vec::<String>::new();
             for edge in &profile.includes {
                 if edge.depth == 0 || edge.depth > chain.len() + 1 {
