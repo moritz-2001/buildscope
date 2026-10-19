@@ -10,6 +10,7 @@ const BuildscopeTour = (() => {
     {view:"overview",target:"#content .grid",title:"Turn evidence into an experiment",text:"Findings suggest where to investigate. Here, math.hpp has six seconds of inclusive processing across two units. Expand its evidence and next experiment, or open the finding. Capture coverage explains which measurements are available.",hint:"Inclusive measurements can overlap. A costly header is a candidate to investigate, not a guaranteed saving."},
     {view:"headers",target:"#content .toolbar",title:"Find headers with reach and cost",text:"Search paths, choose a target, or narrow the path scope. Click a column heading to sort. math.hpp is expensive in two units; scene.hpp reaches three. Reach, measured processing, and associated rebuild work are separate measures.",hint:"Try searching for math, then clear the search. Click any header row for its include paths and dependent units."},
     {view:"headers",detail:"header",target:"#include-paths",title:"Explain why a header matters",text:"math.hpp is included through scene.hpp by render.cpp and scene.cpp. The include chains explain how it enters each compilation. Distribution, rebuild evidence, and history help distinguish repeated cost from a single expensive invocation.",hint:"Source previews and dependent-unit rows are clickable. Native triggers and changed contributors have different meanings."},
+    {view:"compiler",target:"#compiler-panel",title:"Find work across translation units",text:"Compiler work sums recorded inclusive durations across the selected translation units. Inspect template spellings, function optimization, or constant evaluations. Select a row to see each unit’s contribution and its matching recorded scopes.",hint:"Try approximate template families or a target filter. Overlapping inclusive scopes are not elapsed build time or predicted savings."},
     {view:"units",target:"#content .table-wrap",title:"Choose an expensive compilation",text:"A compilation unit is a source/output pair. render.cpp is the slowest example at nine seconds. Frontend, backend, and template activity come from compiler measurements and can overlap.",hint:"Filter by source or unit ID, select a target, sort by action duration, and open a row."},
     {view:"units",detail:"summary",target:"#unit-detail",title:"Inspect compiler activity",text:"The summary shows recorded phases and detail coverage for render.cpp. Tabs separate templates, functions, constant evaluation, includes, trace events, and the original command. Real captures can retain raw evidence and provide a focused profiling command.",hint:"This sample profile uses Clang. GCC supplies aggregate timers rather than individual template or header timings."},
     {view:"units",detail:"templates",target:"#unit-detail",title:"Identify costly template spellings",text:"Mesh<Vertex>::upload() accounts for 1.8 seconds of inclusive recorded work. Compare exact spellings, counts, and longest events. Approximate family grouping helps browse similar specializations.",hint:"Try the grouping checkbox or a source link. Inclusive template timings must not be added as independent elapsed time."},
@@ -104,6 +105,7 @@ const BuildscopeTour = (() => {
       const detail = previous.state.detail;
       if (detail?.type === "unit") await openUnit(detail.id,detail.tab);
       else if (detail?.type === "header") await openHeader(detail.id);
+      else if (detail?.type === "compiler") await CompilerWork.detail(detail);
     } else {
       showWelcome();
     }
@@ -166,7 +168,7 @@ function createExampleData() {
     explanation:"6.00 s of inclusive processing was recorded across two compilation units.",
     evidence:["render.cpp: 3.60 s; scene.cpp: 2.40 s.","Both include math.hpp through scene.hpp. Timings include nested work."],
     experiment:"Move the implementation-only math include out of scene.hpp, then record repeated ordinary builds."}];
-  profile.profiles = units.map((unit,i)=>({unit_id:unit.id,family:"clang",artifact:"example/trace.json",event_count:4,
+  profile.profiles = units.map((unit,i)=>({unit_id:unit.id,family:"clang",artifact:"example/trace.json",event_count:9,granularity_us:0,
     phases:[{name:"Frontend",unit:"ms",value:[7000,4500,1400][i],coverage:"Example recorded invocation"},
       {name:"Backend",unit:"ms",value:[1800,1300,500][i],coverage:"Example recorded invocation"},
       {name:"InstantiateFunction",unit:"ms",value:[1800,1000,200][i],coverage:"Inclusive example scopes"}],
@@ -209,7 +211,10 @@ function createExampleData() {
     return [{id:0,parent:null,name:"Frontend",detail:unit,start_us:0,duration_us:p.phases[0].value*1000,depth:0,thread:"1"},
       {id:1,parent:0,name:"Source",detail:header.slice(source.length+1),start_us:100000,duration_us:[3600000,2400000,1000000][index],depth:1,thread:"1",file:header,line:1},
       {id:2,parent:1,name:"InstantiateFunction",detail:"Mesh<Vertex>::upload()",start_us:200000,duration_us:p.templates[0].max_ms*1000,depth:2,thread:"1",file:headerPath,line:4},
-      {id:3,parent:null,name:"Backend",detail:"Code generation",start_us:p.phases[0].value*1000,duration_us:p.phases[1].value*1000,depth:0,thread:"1"}];
+      {id:3,parent:1,name:"InstantiateFunction",detail:"Mesh<Vertex>::upload()",start_us:200000+p.templates[0].max_ms*1000,duration_us:(p.templates[0].total_ms-p.templates[0].max_ms)*1000,depth:2,thread:"1",file:headerPath,line:4},
+      ...[60,40,20].map((duration,i)=>({id:4+i,parent:1,name:"EvaluateAsConstantExpr",detail:"",start_us:200000+p.templates[0].total_ms*1000+i*60000,duration_us:duration*1000,depth:2,thread:"1",file:headerPath,line:3})),
+      {id:7,parent:null,name:"Backend",detail:"Code generation",start_us:p.phases[0].value*1000,duration_us:p.phases[1].value*1000,depth:0,thread:"1"},
+      {id:8,parent:7,name:"OptFunction",detail:p.functions[0].name,start_us:p.phases[0].value*1000,duration_us:p.functions[0].total_ms*1000,depth:1,thread:"1",file:units[index].source,line:3}];
   }
   function request(path,q={}) {
     if (path === "/api/run") return capture(q.id);
@@ -240,6 +245,7 @@ function createExampleData() {
           delta_processing_ms:h.processing_ms==null||after.headers[i].processing_ms==null?null:after.headers[i].processing_ms-h.processing_ms}))};
     }
     const run = capture(q.run);
+    if (path === "/api/compiler-work") return compilerWorkExample(run,q,events);
     if (path === "/api/unit") return {unit:units.find(u=>u.id===q.unit),profile:run.profiles.find(p=>p.unit_id===q.unit)||null};
     if (path === "/api/header") return run.headers.find(h=>h.path===q.path);
     if (path === "/api/include-paths") {

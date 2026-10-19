@@ -11,6 +11,9 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+mod compiler_work;
+pub use compiler_work::CompilerWorkQuery;
+
 /// A local capture repository. Connections are short-lived so reports can read while
 /// another process finalizes a capture.
 #[derive(Clone)]
@@ -93,6 +96,9 @@ impl Store {
                 duration REAL NOT NULL, data TEXT NOT NULL,
                 PRIMARY KEY(run,unit,idx));
             CREATE INDEX IF NOT EXISTS event_query ON events(run,unit,duration DESC);
+            CREATE INDEX IF NOT EXISTS compiler_work_query ON events(run,name,detail,unit)
+                WHERE name IN ('InstantiateClass','InstantiateFunction','OptFunction','CodeGen Function','isIntegerConstantExpr')
+                    OR name GLOB 'Evaluate*';
             CREATE TABLE IF NOT EXISTS headers(
                 run TEXT NOT NULL, path TEXT NOT NULL, key TEXT NOT NULL,
                 trigger INTEGER NOT NULL, contributor INTEGER NOT NULL,

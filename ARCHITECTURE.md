@@ -278,6 +278,29 @@ and dependency matrices. Unit/header detail is loaded through indexed queries.
 Trace search is paginated and capped, with a parent index supporting nested-scope
 inspection. Browser tables page independently of the complete capture.
 
+Global compiler work uses [store/compiler_work.rs](src/store/compiler_work.rs).
+`Store::compiler_work` takes a `CompilerWorkQuery` and serves bounded pages from
+`/api/compiler-work`. A partial index over relevant normalized `events` supports
+existing captures without re-profiling or a manifest-schema change. Compiler,
+target, activity, and literal spelling/path filters precede aggregation. The key
+preserves compiler index, native activity, exact detail, and supplied file/line;
+missing metadata stays missing. Family grouping uses a deterministic approximate
+SQLite display function and never becomes semantic specialization identity. The
+family scanner preserves angle-operator tokens, quoted literals, and bracketed
+expressions; incomplete argument lists retain their exact spelling. Shared
+spelling fixtures exercise the Rust query and JavaScript unit/tour views, while
+paged aggregation tests verify sorting, work/count conservation, and distinct
+unit reach after grouping.
+
+Ranking, exact-family members, contributing units, and matching events use the
+same query boundary. Durations/counts sum; unit reach is distinct; longest scope
+uses the maximum. Native GCC phase timers remain separate. Coverage derives from
+the filtered inventory and available profiles, independent of spelling searches.
+[compiler-work.js](src/web/compiler-work.js) retains one page at a time, guards
+asynchronous responses against changed selections, and reuses existing source,
+unit, and scope investigations. The guided tour supplies equivalent queries over
+its synthetic normalized events without reaching the real store.
+
 Archives contain a checked capture prefix and regular files/directories. Import
 rejects links and unsafe paths, enforces size/schema limits, and rebuilds indexes.
 Identical imports are idempotent; conflicting IDs are rejected. Imported runs

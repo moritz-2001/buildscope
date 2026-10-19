@@ -52,13 +52,13 @@ function table(columns, rows, rowAction, page=0) {
   const binding={columns,rows,rowAction,page};
   queueMicrotask(()=>{const node=document.querySelector('[data-table="'+id+'"]');if(node)tableBindings.set(node,binding);});
   return '<div data-table="'+id+'"><div class="table-wrap"><table><thead><tr>' + columns.map(c =>
-    '<th class="' + (c.numeric ? "numeric " : "") + (c.key ? "sortable" : "") + '"' +
+    '<th class="' + (c.numeric ? "numeric " : "") + (c.key ? "sortable" : "") + (c.className ? " "+esc(c.className) : "") + '"' +
     (c.key ? ' tabindex="0" role="button" data-sort="' + esc(c.key) + '"' : "") +
     (c.tooltip ? ' title="' + esc(c.tooltip) + '" aria-description="' + esc(c.tooltip) + '"' : "") + '>' + esc(c.label) +
     (state.sort === c.key ? state.descending ? " ↓" : " ↑" : "") + '</th>').join("") +
     '</tr></thead><tbody>' + visible.map(row => '<tr' + (rowAction ? ' class="clickable" tabindex="0" data-action="' + rowAction.action +
       '" data-id="' + esc(rowAction.id(row)) + '"' : "") + '>' + columns.map(c =>
-      '<td class="' + (c.numeric ? "numeric" : "") + '">' + c.render(row) + '</td>').join("") + '</tr>').join("") + '</tbody></table></div>'+
+      '<td class="' + (c.numeric ? "numeric" : "") + (c.className ? " "+esc(c.className) : "") + '">' + c.render(row) + '</td>').join("") + '</tr>').join("") + '</tbody></table></div>'+
       (rows.length>pageSize?'<div class="pagination"><button data-action="table-page" data-id="-1"'+(page===0?' disabled':"")+'>← Previous</button><span>'+
       num(start+1)+"–"+num(Math.min(start+pageSize,rows.length))+" of "+num(rows.length)+'</span><button data-action="table-page" data-id="1"'+
       (start+pageSize>=rows.length?' disabled':"")+'>Next →</button></div>':"")+'</div>';
@@ -151,7 +151,7 @@ function findingsHTML(findings) {
 function render() {
   if(!state.run)return;
   const run=state.run, launcher=run.kind==="launcher";
-  const titles={overview:"Understand the wait.",headers:"Which headers create work?",units:"Why is this file expensive?",history:"Your build history.",compare:"Measure what changed."};
+  const titles={overview:"Understand the wait.",headers:"Which headers create work?",compiler:"Compiler work",units:"Why is this file expensive?",history:"Your build history.",compare:"Measure what changed."};
   $("#title").textContent=titles[state.view];
   $("#breadcrumb").textContent=state.view==="units"?"COMPILATION UNITS":state.view.toUpperCase();
   $("#status").textContent=(BuildscopeTour.active?"Example data · ":"")+run.status+" · "+run.kind; $("#status").className="badge "+run.status;
@@ -180,6 +180,9 @@ function render() {
     html='<p class="muted">Reach, processing cost, and rebuild impact describe different kinds of work.</p>'+toolbar("Filter headers by path…")+
       notes(["Processing totals cover the entire capture; target selection narrows reach and rebuilt work. Inclusive costs overlap. Reach comes from the available dependency inventory; direct counts describe recorded includes. Historical triggers count matching configurations and requested target sets; ordinary builds are separate from profiles."])+
       table(headerColumns(),sortRows(headerRows()),{action:"header",id:h=>h.path});
+  } else if(state.view==="compiler") {
+    if(!["work","units","count","longest","name"].includes(state.sort))state.sort="work";
+    html=CompilerWork.shell();
   } else if(state.view==="units") {
     html='<p class="muted">Inspect the compiler activity behind an expensive compilation.</p>'+toolbar("Filter source files or unit IDs…")+
       notes(["Unexecuted units have no action timing in this run. Compiler phase/subphase measurements may overlap."])+
@@ -201,6 +204,7 @@ function render() {
   }
   $("#content").innerHTML=html;
   bindFilters();
+  if(state.view==="compiler")CompilerWork.load().catch(error=>toast(error.message));
   if(state.view==="overview") drawBuildTimeline();
   if(state.view==="history") drawHistory();
   if(state.view==="compare") {
@@ -252,7 +256,7 @@ async function loadRun(id) {
   const version=++generation;
   const run=await api("/api/run",{id});
   if(version!==generation)return;
-  state.run=run;state.q="";state.target="all";state.scope="all";
+  state.run=run;state.q="";state.target="all";state.scope="all";state.compilerIdentity="";
   indexRun(run);
   $("#run").value=run.id;
   history.replaceState(null,"",BuildscopeTour.active?"?tour=1#"+state.view:"?run="+encodeURIComponent(run.id)+"#"+state.view);
@@ -363,7 +367,7 @@ async function openUnit(id,tab="summary") {
       if(group) {
         const groups=new Map();
         for(const e of entries) {
-          const key=family(e.name),value=groups.get(key)||{name:key,total_ms:0,count:0,max_ms:0};
+          const key=templateFamily(e.name),value=groups.get(key)||{name:key,total_ms:0,count:0,max_ms:0};
           value.total_ms+=e.total_ms;value.count+=e.count;value.max_ms=Math.max(value.max_ms,e.max_ms);groups.set(key,value);
         }
         symbols=[...groups.values()].sort((a,b)=>b.total_ms-a.total_ms);
@@ -427,15 +431,6 @@ async function openScope(index) {
     table([{label:"Activity",render:e=>esc(e.name)},{label:"Detail",render:e=>'<span class="path">'+esc(e.detail)+'</span>'},
       {label:"Duration",numeric:true,render:e=>time(e.duration_us/1000)}],result.children,{action:"scope",id:e=>e.id}));
 }
-function family(name) {
-  let depth=0,result="";
-  for(const c of name) {
-    if(c==="<"){if(!depth)result+="<…>";depth++;}
-    else if(c===">"&&depth)depth--;
-    else if(!depth)result+=c;
-  }
-  return depth?name:result;
-}
 async function showSource(path,line) {
   const back=state.detail?{...state.detail}:null;
   const result=await api("/api/source",{run:state.run.id,path});
@@ -443,7 +438,7 @@ async function showSource(path,line) {
     (back?'<button id="source-back" class="action">← Back to investigation</button>':"")+
     notes([result.matches_capture?"Content matches this capture.":"Current content does not match the captured fingerprint. These lines are not evidence of the recorded source version."])+
     '<pre class="source">'+result.text.split("\n").map((text,i)=>'<span class="source-line'+(i+1===Number(line)?" selected":"")+'"><span class="lineno">'+(i+1)+'</span>'+esc(text)+'</span>').join("")+'</pre>');
-  if(back)$("#source-back").onclick=()=>back.type==="unit"?openUnit(back.id,back.tab):openHeader(back.id).catch(e=>toast(e.message));
+  if(back)$("#source-back").onclick=()=>Promise.resolve(back.type==="unit"?openUnit(back.id,back.tab):back.type==="compiler"?CompilerWork.detail(back):openHeader(back.id)).catch(e=>toast(e.message));
   $(".source-line.selected")?.scrollIntoView({block:"center"});
 }
 async function showComparison() {
@@ -526,6 +521,9 @@ document.addEventListener("click",async event=>{
       const area=button.closest("[data-table]"),binding=tableBindings.get(area);
       if(binding){area.outerHTML=table(binding.columns,binding.rows,binding.rowAction,binding.page+Number(id));}
     }
+    else if(action==="compiler-row")await CompilerWork.open(Number(id));
+    else if(action==="compiler-member")await CompilerWork.member(Number(id));
+    else if(action==="compiler-scope")await CompilerWork.scope(Number(id));
     else if(action==="header")await openHeader(id);
     else if(action==="unit")await openUnit(id);
     else if(action==="unit-tab")await openUnit(id,button.dataset.tab);
@@ -545,7 +543,7 @@ document.addEventListener("click",async event=>{
 });
 document.addEventListener("keydown",e=>{if((e.key==="Enter"||e.key===" ")&&e.target.matches("tr[data-action],th[data-sort]")){e.preventDefault();e.target.click();}});
 document.querySelectorAll("nav button").forEach(button=>button.onclick=()=>{
-  state.view=button.dataset.view;state.q="";state.sort=state.view==="units"?"work":"processing_ms";state.descending=true;
+  state.view=button.dataset.view;state.q="";state.sort=["units","compiler"].includes(state.view)?"work":"processing_ms";state.descending=true;
   history.replaceState(null,"",BuildscopeTour.active?"?tour=1#"+state.view:"?run="+encodeURIComponent(state.run.id)+"#"+state.view);render();window.scrollTo(0,0);
 });
 $("#close-detail").onclick=()=>{$("#detail").close();state.detail=null;};
@@ -571,7 +569,7 @@ $("#start-tour").disabled=true;
   try{
     const result=await api("/api/runs");state.runs=result.runs;state.store=result.store;
     $("#run").innerHTML=runOptions(result.initial);
-    const view=location.hash.slice(1);if(["overview","headers","units","history","compare"].includes(view))state.view=view;
+    const view=location.hash.slice(1);if(["overview","headers","compiler","units","history","compare"].includes(view))state.view=view;
     if(result.initial)await loadRun(new URLSearchParams(location.search).get("run")||result.initial);
     else showWelcome();
   }catch(error){showWelcome();toast(error.message);}

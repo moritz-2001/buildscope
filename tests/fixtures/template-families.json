@@ -1,0 +1,150 @@
+[
+  [
+    "std::vector<int>",
+    "std::vector<…>"
+  ],
+  [
+    "std::vector<double>",
+    "std::vector<…>"
+  ],
+  [
+    "std::map<int, std::vector<double>>",
+    "std::map<…>"
+  ],
+  [
+    "std::vector<int>::emplace_back<int>",
+    "std::vector<…>::emplace_back<…>"
+  ],
+  [
+    "std::vector<double>::emplace_back<double>",
+    "std::vector<…>::emplace_back<…>"
+  ],
+  [
+    "std::chrono::operator<=><int>",
+    "std::chrono::operator<=><…>"
+  ],
+  [
+    "std::chrono::operator<=><double>",
+    "std::chrono::operator<=><…>"
+  ],
+  [
+    "std::operator<< <char>",
+    "std::operator<< <…>"
+  ],
+  [
+    "std::operator<< <wchar_t>",
+    "std::operator<< <…>"
+  ],
+  [
+    "std::operator<<<char>",
+    "std::operator<<<…>"
+  ],
+  [
+    "std::operator<<<wchar_t>",
+    "std::operator<<<…>"
+  ],
+  [
+    "stream::operator>><int>",
+    "stream::operator>><…>"
+  ],
+  [
+    "stream::operator>><double>",
+    "stream::operator>><…>"
+  ],
+  [
+    "stream::operator<<=<int>",
+    "stream::operator<<=<…>"
+  ],
+  [
+    "stream::operator>>=<int>",
+    "stream::operator>>=<…>"
+  ],
+  [
+    "operator<=<int>",
+    "operator<=<…>"
+  ],
+  [
+    "operator>=<int>",
+    "operator>=<…>"
+  ],
+  [
+    "operator< <int>",
+    "operator< <…>"
+  ],
+  [
+    "operator> <int>",
+    "operator> <…>"
+  ],
+  [
+    "Callable<int>::operator()<double>",
+    "Callable<…>::operator()<…>"
+  ],
+  [
+    "Foo<(1 > 0)>",
+    "Foo<…>"
+  ],
+  [
+    "Foo<(3 < 5)>",
+    "Foo<…>"
+  ],
+  [
+    "Foo<(8 >> 1)>",
+    "Foo<…>"
+  ],
+  [
+    "Foo<'<'>",
+    "Foo<…>"
+  ],
+  [
+    "Foo<'>'>",
+    "Foo<…>"
+  ],
+  [
+    "Foo<'\\''>",
+    "Foo<…>"
+  ],
+  [
+    "Foo<1'000>",
+    "Foo<…>"
+  ],
+  [
+    "Foo<0xAB'CD>",
+    "Foo<…>"
+  ],
+  [
+    "Foo<\">\">",
+    "Foo<…>"
+  ],
+  [
+    "Foo<R\"tag(> \" <)tag\">",
+    "Foo<…>"
+  ],
+  [
+    "Foo<std::array<int, 2>{1, 2}>",
+    "Foo<…>"
+  ],
+  [
+    "Holder<&stream::operator<< <int>>",
+    "Holder<…>"
+  ],
+  [
+    "ns::myoperator<int>",
+    "ns::myoperator<…>"
+  ],
+  [
+    "Broken<Thing<int>",
+    "Broken<Thing<int>"
+  ],
+  [
+    "Foo<(1 > 0>",
+    "Foo<(1 > 0>"
+  ],
+  [
+    "NoTemplate",
+    "NoTemplate"
+  ],
+  [
+    "",
+    ""
+  ]
+]

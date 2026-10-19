@@ -10,7 +10,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 ctrlc = "3"
 libc = "0.2"
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.38", features = ["bundled", "functions"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

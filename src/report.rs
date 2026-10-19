@@ -2,7 +2,7 @@
 //! large traces out of the initial browser payload.
 use crate::{
     analysis,
-    store::{EventQuery, Store},
+    store::{CompilerWorkQuery, EventQuery, Store},
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -99,6 +99,10 @@ fn handle(
             include_bytes!("web/app.js"),
             "text/javascript; charset=utf-8",
         )),
+        "/compiler-work.js" => Ok(asset(
+            include_bytes!("web/compiler-work.js"),
+            "text/javascript; charset=utf-8",
+        )),
         "/tour.js" => Ok(asset(
             include_bytes!("web/tour.js"),
             "text/javascript; charset=utf-8",
@@ -119,6 +123,47 @@ fn handle(
             let run = store.resolve_id(required(&query, "run")?)?;
             Ok(json_response(
                 store.unit_detail(&run, required(&query, "unit")?)?,
+                200,
+            ))
+        }
+        "/api/compiler-work" => {
+            let run = store.resolve_id(required(&query, "run")?)?;
+            let value = |key: &str| query.get(key).map(String::as_str).unwrap_or("");
+            Ok(json_response(
+                store.compiler_work(
+                    &run,
+                    CompilerWorkQuery {
+                        category: if value("category").is_empty() {
+                            "templates"
+                        } else {
+                            value("category")
+                        },
+                        text: value("q"),
+                        target: value("target"),
+                        activity: value("activity"),
+                        compiler: if value("compiler").is_empty() {
+                            None
+                        } else {
+                            Some(value("compiler").parse()?)
+                        },
+                        families: value("families") == "true",
+                        entity: value("entity"),
+                        unit: value("unit"),
+                        breakdown: if value("breakdown").is_empty() {
+                            "units"
+                        } else {
+                            value("breakdown")
+                        },
+                        order: if value("sort").is_empty() {
+                            "work"
+                        } else {
+                            value("sort")
+                        },
+                        descending: value("descending") != "false",
+                        offset: value("offset").parse().unwrap_or(0),
+                        limit: value("limit").parse().unwrap_or(100),
+                    },
+                )?,
                 200,
             ))
         }

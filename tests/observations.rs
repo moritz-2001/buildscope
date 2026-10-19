@@ -4,11 +4,468 @@ use buildscope::{
     analysis, capture, compiler,
     model::*,
     project,
-    store::{EventQuery, Store},
+    store::{CompilerWorkQuery, EventQuery, Store},
     util::*,
 };
 use serde_json::json;
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
+
+#[test]
+fn template_families_preserve_spellings_work_and_every_sorted_page() {
+    let pairs: Vec<(String, String)> =
+        serde_json::from_str(include_str!("fixtures/template-families.json")).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut capture = capture_fixture(temp.path());
+    capture.project.units = vec![
+        unit(temp.path(), "a.cpp", "build/CMakeFiles/app.dir/a.o"),
+        unit(temp.path(), "b.cpp", "build/CMakeFiles/app.dir/b.o"),
+        unit(temp.path(), "c.cpp", "build/CMakeFiles/tests.dir/c.o"),
+    ];
+    let store = Store::open(&temp.path().join("store")).unwrap();
+    let mut expected = BTreeMap::<String, (f64, usize, f64, BTreeSet<String>)>::new();
+    for (unit_index, unit) in capture.project.units.iter().enumerate() {
+        let events: Vec<TraceEvent> = pairs
+            .iter()
+            .enumerate()
+            .take(if unit_index == 2 { 8 } else { pairs.len() })
+            .map(|(index, (spelling, family))| {
+                let work_ms = ((index + 1) * (unit_index + 1)) as f64;
+                let entry = expected.entry(family.clone()).or_default();
+                entry.0 += work_ms;
+                entry.1 += 1;
+                entry.2 = entry.2.max(work_ms);
+                entry.3.insert(unit.id.clone());
+                TraceEvent {
+                    id: index,
+                    name: "InstantiateFunction".into(),
+                    detail: spelling.clone(),
+                    thread: "1".into(),
+                    start_us: index as f64 * 1000.0,
+                    duration_us: work_ms * 1000.0,
+                    file: Some(format!("/project/header_{}.hpp", index % 2)),
+                    line: Some(index as u64 + 1),
+                    parent: None,
+                    depth: 0,
+                }
+            })
+            .collect();
+        store.save_events(&capture.id, &unit.id, &events).unwrap();
+        capture.profiles.push(CompilationProfile {
+            unit_id: unit.id.clone(),
+            family: "clang".into(),
+            event_count: events.len(),
+            granularity_us: Some(0),
+            ..CompilationProfile::default()
+        });
+    }
+    store.save(&capture).unwrap();
+    let query = || CompilerWorkQuery {
+        families: true,
+        limit: 3,
+        ..CompilerWorkQuery::default()
+    };
+    for order in ["work", "units", "count", "longest", "name"] {
+        for descending in [true, false] {
+            let mut rows = Vec::new();
+            loop {
+                let page = store
+                    .compiler_work(
+                        &capture.id,
+                        CompilerWorkQuery {
+                            order,
+                            descending,
+                            offset: rows.len(),
+                            ..query()
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(page["total"], expected.len());
+                rows.extend(page["rows"].as_array().unwrap().iter().cloned());
+                if rows.len() == expected.len() {
+                    break;
+                }
+                assert!(!page["rows"].as_array().unwrap().is_empty());
+            }
+            let names: BTreeSet<_> = rows
+                .iter()
+                .map(|row| row["name"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(
+                names,
+                expected.keys().cloned().collect(),
+                "{order}, descending={descending}"
+            );
+            assert_eq!(rows.len(), names.len());
+            let field = match order {
+                "work" => "work_ms",
+                "longest" => "max_ms",
+                other => other,
+            };
+            for adjacent in rows.windows(2) {
+                let order = if field == "name" {
+                    adjacent[0][field]
+                        .as_str()
+                        .unwrap()
+                        .cmp(adjacent[1][field].as_str().unwrap())
+                } else {
+                    adjacent[0][field]
+                        .as_f64()
+                        .unwrap()
+                        .partial_cmp(&adjacent[1][field].as_f64().unwrap())
+                        .unwrap()
+                };
+                assert!(if descending {
+                    !order.is_lt()
+                } else {
+                    !order.is_gt()
+                });
+            }
+            for row in rows {
+                let stats = &expected[row["name"].as_str().unwrap()];
+                assert_eq!(row["work_ms"], stats.0);
+                assert_eq!(row["count"], stats.1);
+                assert_eq!(row["max_ms"], stats.2);
+                assert_eq!(row["units"], stats.3.len());
+            }
+        }
+    }
+    let families = store
+        .compiler_work(
+            &capture.id,
+            CompilerWorkQuery {
+                limit: 200,
+                ..query()
+            },
+        )
+        .unwrap();
+    for family in families["rows"].as_array().unwrap() {
+        let key = family["key"].as_str().unwrap();
+        for breakdown in ["members", "units"] {
+            let detail = store
+                .compiler_work(
+                    &capture.id,
+                    CompilerWorkQuery {
+                        entity: key,
+                        breakdown,
+                        limit: 200,
+                        ..query()
+                    },
+                )
+                .unwrap();
+            let members = detail["rows"].as_array().unwrap();
+            assert_eq!(
+                members
+                    .iter()
+                    .map(|row| row["work_ms"].as_f64().unwrap())
+                    .sum::<f64>(),
+                family["work_ms"]
+            );
+            assert_eq!(
+                members
+                    .iter()
+                    .map(|row| row["count"].as_u64().unwrap())
+                    .sum::<u64>(),
+                family["count"]
+            );
+            if breakdown == "units" {
+                assert_eq!(members.len(), family["units"]);
+            }
+        }
+    }
+}
+
+#[test]
+fn global_compiler_work_sums_units_and_preserves_evidence_boundaries() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let store = Store::open(&root.join("store")).unwrap();
+    let mut capture = capture_fixture(root);
+    capture.kind = "profile".into();
+    capture.project.units = vec![
+        unit(root, "first.cpp", "build/CMakeFiles/app.dir/first.o"),
+        unit(root, "first.cpp", "build/CMakeFiles/tests.dir/first.o"),
+        unit(root, "second.cpp", "build/CMakeFiles/app.dir/second.o"),
+        unit(root, "alternative.cpp", "build/CMakeFiles/app.dir/alt.o"),
+        unit(root, "gcc.cpp", "build/CMakeFiles/app.dir/gcc.o"),
+        unit(root, "missing.cpp", "build/CMakeFiles/app.dir/missing.o"),
+    ];
+    let clang = capture.project.compilers[0].clone();
+    capture.project.compilers.push(clang.clone());
+    capture.project.compilers.push(CompilerInfo {
+        family: "gcc".into(),
+        version: "test gcc".into(),
+        ..clang
+    });
+    capture.project.units[3].compiler = 1;
+    capture.project.units[4].compiler = 2;
+    capture.profiles = capture.project.units[..5]
+        .iter()
+        .enumerate()
+        .map(|(index, unit)| CompilationProfile {
+            unit_id: unit.id.clone(),
+            family: if index == 4 { "gcc" } else { "clang" }.into(),
+            event_count: if index == 4 { 0 } else { 1 },
+            granularity_us: (index != 4).then_some(500),
+            phases: if index == 4 {
+                vec![Metric {
+                    name: "constant expression evaluation".into(),
+                    value: 140.0,
+                    unit: "ms".into(),
+                    origin: "measured".into(),
+                    coverage: "complete".into(),
+                }]
+            } else {
+                vec![]
+            },
+            ..CompilationProfile::default()
+        })
+        .collect();
+    let event = |name: &str, detail: &str, duration_us: f64, line: Option<u64>| TraceEvent {
+        id: 0,
+        name: name.into(),
+        detail: detail.into(),
+        thread: "1".into(),
+        start_us: 0.0,
+        duration_us,
+        file: line.map(|_| "/project/header.hpp".into()),
+        line,
+        parent: None,
+        depth: 0,
+    };
+    let mut events = vec![
+        event("InstantiateFunction", "Entity<int>", 10_000.0, Some(7)),
+        event("InstantiateFunction", "Entity<int>", 20_000.0, Some(7)),
+        event("InstantiateFunction", "Entity<float>", 5_000.0, Some(7)),
+        event("InstantiateFunction", "Entity<int>", 2_000.0, Some(9)),
+        event("EvaluateAsRValue", "", 3_000.0, None),
+        event("OptFunction", "render", 4_000.0, Some(12)),
+        event("CodeGen Function", "render", 1_000.0, Some(12)),
+        event("isIntegerConstantExpr", "", 1_000.0, None),
+    ];
+    for (index, event) in events.iter_mut().enumerate() {
+        event.id = index;
+        event.start_us = index as f64 * 1000.0;
+    }
+    let first = &capture.project.units[0].id;
+    store.save_events(&capture.id, first, &events).unwrap();
+    for (index, duration) in [(1, 40_000.0), (2, 50_000.0), (3, 70_000.0)] {
+        store
+            .save_events(
+                &capture.id,
+                &capture.project.units[index].id,
+                &[event(
+                    "InstantiateFunction",
+                    "Entity<int>",
+                    duration,
+                    Some(7),
+                )],
+            )
+            .unwrap();
+    }
+    store.save(&capture).unwrap();
+    let query = || CompilerWorkQuery {
+        compiler: Some(0),
+        ..CompilerWorkQuery::default()
+    };
+    let global = store.compiler_work(&capture.id, query()).unwrap();
+    assert_eq!(global["total"], 3);
+    let top = &global["rows"][0];
+    assert_eq!(top["work_ms"], 120.0);
+    assert_eq!(top["units"], 3); // first.cpp compiled into app and tests counts twice.
+    assert_eq!(top["count"], 4);
+    assert_eq!(top["max_ms"], 50.0);
+    assert_eq!(top["line"], 7);
+    let key = top["key"].as_str().unwrap();
+    let contributions = store
+        .compiler_work(
+            &capture.id,
+            CompilerWorkQuery {
+                entity: key,
+                limit: 1,
+                offset: 1,
+                ..query()
+            },
+        )
+        .unwrap();
+    assert_eq!(contributions["total"], 3);
+    assert_eq!(contributions["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(contributions["rows"][0]["work_ms"], 40.0);
+    let scopes = store
+        .compiler_work(
+            &capture.id,
+            CompilerWorkQuery {
+                entity: key,
+                breakdown: "events",
+                unit: first,
+                ..query()
+            },
+        )
+        .unwrap();
+    assert_eq!(scopes["total"], 2);
+    assert_eq!(scopes["rows"][0]["event"]["id"], 1);
+    let app = store
+        .compiler_work(
+            &capture.id,
+            CompilerWorkQuery {
+                target: "app",
+                ..query()
+            },
+        )
+        .unwrap();
+    assert_eq!(app["rows"][0]["work_ms"], 80.0);
+    assert_eq!(app["rows"][0]["units"], 2);
+    assert_eq!(app["coverage"][0]["units"], 3);
+    assert_eq!(app["coverage"][0]["trace_units"], 2);
+    let families = store
+        .compiler_work(
+            &capture.id,
+            CompilerWorkQuery {
+                families: true,
+                ..query()
+            },
+        )
+        .unwrap();
+    assert_eq!(families["total"], 1);
+    assert_eq!(families["rows"][0]["work_ms"], 127.0);
+    assert_eq!(families["rows"][0]["units"], 3); // Distinct units, not summed specialization reach.
+    assert!(families["rows"][0]["file"].is_null());
+    let members = store
+        .compiler_work(
+            &capture.id,
+            CompilerWorkQuery {
+                families: true,
+                entity: families["rows"][0]["key"].as_str().unwrap(),
+                breakdown: "members",
+                ..query()
+            },
+        )
+        .unwrap();
+    assert_eq!(members["total"], 3);
+    let compilers = store
+        .compiler_work(&capture.id, CompilerWorkQuery::default())
+        .unwrap();
+    assert_eq!(compilers["total"], 4);
+    assert_eq!(compilers["rows"][1]["compiler"], 1);
+    let functions = store
+        .compiler_work(
+            &capture.id,
+            CompilerWorkQuery {
+                category: "functions",
+                ..query()
+            },
+        )
+        .unwrap();
+    assert_eq!(functions["total"], 2);
+    assert_eq!(functions["rows"][0]["activity"], "OptFunction");
+    assert_eq!(functions["rows"][0]["work_ms"], 4.0);
+    let codegen = store
+        .compiler_work(
+            &capture.id,
+            CompilerWorkQuery {
+                category: "functions",
+                activity: "CodeGen Function",
+                ..query()
+            },
+        )
+        .unwrap();
+    assert_eq!(codegen["total"], 1);
+    assert_eq!(codegen["rows"][0]["work_ms"], 1.0);
+    let evaluations = store
+        .compiler_work(
+            &capture.id,
+            CompilerWorkQuery {
+                category: "evaluations",
+                ..query()
+            },
+        )
+        .unwrap();
+    assert_eq!(evaluations["total"], 2);
+    assert_eq!(evaluations["rows"][0]["name"], "");
+    assert!(evaluations["timers"].as_array().unwrap().is_empty());
+    let gcc = store
+        .compiler_work(
+            &capture.id,
+            CompilerWorkQuery {
+                category: "evaluations",
+                compiler: Some(2),
+                ..CompilerWorkQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(gcc["total"], 0);
+    assert_eq!(gcc["timers"][0]["work_ms"], 140.0);
+    for literal in ["%", "_", "' OR 1=1 --"] {
+        assert_eq!(
+            store
+                .compiler_work(
+                    &capture.id,
+                    CompilerWorkQuery {
+                        text: literal,
+                        ..query()
+                    }
+                )
+                .unwrap()["total"],
+            0
+        );
+    }
+    let ascending = store
+        .compiler_work(
+            &capture.id,
+            CompilerWorkQuery {
+                descending: false,
+                limit: 1,
+                ..query()
+            },
+        )
+        .unwrap();
+    assert_eq!(ascending["rows"][0]["work_ms"], 2.0);
+    assert!(
+        store
+            .compiler_work(
+                &capture.id,
+                CompilerWorkQuery {
+                    order: "work; DROP TABLE events",
+                    ..query()
+                }
+            )
+            .is_err()
+    );
+
+    // An existing store needs no recapture. Replacing a unit's latest attempt must
+    // replace its contribution; adding the global index cannot duplicate evidence.
+    rusqlite::Connection::open(store.root.join("index.sqlite3"))
+        .unwrap()
+        .execute("DROP INDEX compiler_work_query", [])
+        .unwrap();
+    let reopened = Store::open(&store.root).unwrap();
+    reopened
+        .save_events(
+            &capture.id,
+            first,
+            &[event(
+                "InstantiateFunction",
+                "Entity<int>",
+                3_000.0,
+                Some(7),
+            )],
+        )
+        .unwrap();
+    let replaced = reopened.compiler_work(&capture.id, query()).unwrap();
+    assert_eq!(replaced["rows"][0]["work_ms"], 93.0);
+    assert_eq!(replaced["rows"][0]["count"], 3);
+    let archive = root.join("global.buildscope");
+    reopened.export(&capture.id, &archive, false).unwrap();
+    let imported = Store::open(&root.join("imported")).unwrap();
+    imported.import(&archive).unwrap();
+    assert_eq!(
+        imported.compiler_work(&capture.id, query()).unwrap()["rows"],
+        replaced["rows"]
+    );
+}
 
 #[test]
 fn paired_clang_headers_keep_nested_costs_and_thread_boundaries() {
