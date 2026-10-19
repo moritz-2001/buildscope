@@ -292,6 +292,14 @@ spelling fixtures exercise the Rust query and JavaScript unit/tour views, while
 paged aggregation tests verify sorting, work/count conservation, and distinct
 unit reach after grouping.
 
+The response keeps `total` as the matching row count and adds `summary.work_ms`
+as the sum of all matching inclusive work before sorting and pagination. It is
+computed with the count on the same read snapshot as the page and coverage;
+family grouping preserves work while changing row count. The browser displays
+this summary above the ranking, clearing it during search and ignoring stale
+responses. A zero sum is shown as unavailable when selected inventory coverage
+contains no named trace evidence. Native GCC timers are excluded from this sum.
+
 Ranking, exact-family members, contributing units, and matching events use the
 same query boundary. Durations/counts sum; unit reach is distinct; longest scope
 uses the maximum. Native GCC phase timers remain separate. Coverage derives from

@@ -23,9 +23,21 @@ test('template families preserve C++ operators and expressions in unit views and
   assert.equal(all.total,new Set(pairs.map(pair=>pair[1])).size);
   assert.equal(all.rows.reduce((sum,row)=>sum+row.count,0),pairs.length*2);
   assert.equal(all.rows.reduce((sum,row)=>sum+row.work_ms,0),pairs.length*(pairs.length+1)/2*3);
+  assert.equal(all.summary.work_ms,all.rows.reduce((sum,row)=>sum+row.work_ms,0));
+  assert.equal(result({families:false}).summary.work_ms,all.summary.work_ms);
+  assert.equal(result({q:'absent'}).summary.work_ms,0);
+  for(const query of [{q:'header.hpp'},{q:pairs[0][0]},{target:'app'},{compiler:0},{compiler:1},{activity:'InstantiateClass'}]) {
+    const filtered=result({...query,limit:200});
+    assert.equal(filtered.summary.work_ms,filtered.rows.reduce((sum,row)=>sum+row.work_ms,0));
+    assert.equal(result({...query,limit:1,offset:1}).summary.work_ms,filtered.summary.work_ms);
+  }
   for(const sort of ['work','units','count','longest','name'])for(const descending of [true,false]) {
     const paged=[];
-    for(let offset=0;offset<all.total;offset+=3)paged.push(...result({sort,descending,offset,limit:3}).rows);
+    for(let offset=0;offset<all.total;offset+=3) {
+      const page=result({sort,descending,offset,limit:3});
+      assert.equal(page.summary.work_ms,all.summary.work_ms);
+      paged.push(...page.rows);
+    }
     const field={work:'work_ms',longest:'max_ms'}[sort]||sort;
     for(let index=1;index<paged.length;index++)assert.ok(descending?paged[index-1][field]>=paged[index][field]:paged[index-1][field]<=paged[index][field]);
     assert.deepEqual(paged.map(row=>row.key).sort(),Array.from(all.rows,row=>row.key).sort());
@@ -156,5 +168,59 @@ test('global compiler work sums exact scopes and drills into units and original 
   assert.equal(evaluations.rows[0].count,9);
   const ordinary=data.request('/api/compiler-work',{...base,run:'example-before-1'});
   assert.equal(ordinary.total,0);
+  assert.equal(ordinary.summary.work_ms,0);
   assert.equal(ordinary.coverage[0].trace_units,0);
+});
+
+test('compiler search displays the full total and clears or rejects stale summaries',async()=>{
+  const context=examples(),data=context.examples;
+  const nodes=new Map(['filter','compiler-filter','compiler-families','compiler-results','compiler-coverage',
+    'compiler-prev','compiler-next','compiler-timers'].map(id=>['#'+id,{innerHTML:'',value:'',isConnected:true}]));
+  const requests=[];
+  const state={run:data.profile,view:'compiler',compilerCategory:'functions',q:'',target:'all',sort:'work',descending:true};
+  Object.assign(context,{
+    state,
+    document:{querySelector:selector=>nodes.get(selector)||null,querySelectorAll:()=>[]},
+    api:(path,query)=>new Promise((resolve,reject)=>requests.push({path,query,resolve,reject})),
+    table:()=>'<table></table>',
+    clearTimeout:()=>{},setTimeout:()=>1,
+  });
+  // Use the report's actual formatting and selector helpers when rendering results.
+  const app=readFileSync(require.resolve('../src/web/app.js'),'utf8');
+  vm.runInContext(app.slice(0,app.indexOf('const signed'))+';globalThis.compilerWork=CompilerWork;',context);
+  const results=nodes.get('#compiler-results'),search=nodes.get('#filter');
+  const respond=request=>request.resolve(data.request(request.path,{...request.query,limit:1}));
+
+  const initial=context.compilerWork.load();
+  respond(requests.shift());
+  await initial;
+  assert.match(results.innerHTML,/Total matching inclusive work: 2\.75 s/);
+  assert.match(results.innerHTML,/3 results/);
+  assert.match(results.innerHTML,/1–1 of 3/);
+
+  const stale=context.compilerWork.load(),oldRequest=requests.shift();
+  search.value='absent';
+  search.oninput();
+  assert.match(results.innerHTML,/Searching/);
+  assert.doesNotMatch(results.innerHTML,/Total matching/);
+  const filtered=context.compilerWork.load();
+  respond(requests.shift());
+  await filtered;
+  assert.match(results.innerHTML,/Total matching inclusive work: 0\.0 ms/);
+  assert.match(results.innerHTML,/0 results/);
+  respond(oldRequest);
+  await stale;
+  assert.doesNotMatch(results.innerHTML,/2\.75 s/);
+
+  state.run=data.request('/api/run',{id:'example-before-1'});
+  const ordinary=context.compilerWork.load();
+  respond(requests.shift());
+  await ordinary;
+  assert.match(results.innerHTML,/Total matching inclusive work: Unavailable/);
+
+  const failed=context.compilerWork.load();
+  requests.shift().reject(new Error('Search failed'));
+  await assert.rejects(failed,/Search failed/);
+  assert.match(results.innerHTML,/Search failed/);
+  assert.doesNotMatch(results.innerHTML,/Total matching/);
 });

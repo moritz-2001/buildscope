@@ -222,6 +222,10 @@ constant evaluations across all translation units in the selected capture.
 Each row sums recorded inclusive scope durations and shows distinct contributing
 source/output pairs, recorded scope count, and longest scope. Target, compiler,
 activity, and spelling/source-path filters apply before aggregation.
+The total matching inclusive work above the results covers every matching row,
+including other pages. Sorting and approximate family grouping preserve this
+work total. An empty search result shows zero when named trace evidence exists;
+a selection without named trace evidence shows **Unavailable**.
 
 Select a row for its paginated per-unit contributions, then open the existing
 unit investigation or inspect its matching recorded scopes and their containment.

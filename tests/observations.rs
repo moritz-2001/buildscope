@@ -84,6 +84,10 @@ fn template_families_preserve_spellings_work_and_every_sorted_page() {
                     )
                     .unwrap();
                 assert_eq!(page["total"], expected.len());
+                assert_eq!(
+                    page["summary"]["work_ms"],
+                    expected.values().map(|stats| stats.0).sum::<f64>()
+                );
                 rows.extend(page["rows"].as_array().unwrap().iter().cloned());
                 if rows.len() == expected.len() {
                     break;
@@ -273,6 +277,7 @@ fn global_compiler_work_sums_units_and_preserves_evidence_boundaries() {
     };
     let global = store.compiler_work(&capture.id, query()).unwrap();
     assert_eq!(global["total"], 3);
+    assert_eq!(global["summary"]["work_ms"], 127.0);
     let top = &global["rows"][0];
     assert_eq!(top["work_ms"], 120.0);
     assert_eq!(top["units"], 3); // first.cpp compiled into app and tests counts twice.
@@ -292,6 +297,7 @@ fn global_compiler_work_sums_units_and_preserves_evidence_boundaries() {
         )
         .unwrap();
     assert_eq!(contributions["total"], 3);
+    assert_eq!(contributions["summary"]["work_ms"], 120.0);
     assert_eq!(contributions["rows"].as_array().unwrap().len(), 1);
     assert_eq!(contributions["rows"][0]["work_ms"], 40.0);
     let scopes = store
@@ -306,6 +312,7 @@ fn global_compiler_work_sums_units_and_preserves_evidence_boundaries() {
         )
         .unwrap();
     assert_eq!(scopes["total"], 2);
+    assert_eq!(scopes["summary"]["work_ms"], 30.0);
     assert_eq!(scopes["rows"][0]["event"]["id"], 1);
     let app = store
         .compiler_work(
@@ -317,6 +324,7 @@ fn global_compiler_work_sums_units_and_preserves_evidence_boundaries() {
         )
         .unwrap();
     assert_eq!(app["rows"][0]["work_ms"], 80.0);
+    assert_eq!(app["summary"]["work_ms"], 87.0);
     assert_eq!(app["rows"][0]["units"], 2);
     assert_eq!(app["coverage"][0]["units"], 3);
     assert_eq!(app["coverage"][0]["trace_units"], 2);
@@ -330,6 +338,7 @@ fn global_compiler_work_sums_units_and_preserves_evidence_boundaries() {
         )
         .unwrap();
     assert_eq!(families["total"], 1);
+    assert_eq!(families["summary"], global["summary"]);
     assert_eq!(families["rows"][0]["work_ms"], 127.0);
     assert_eq!(families["rows"][0]["units"], 3); // Distinct units, not summed specialization reach.
     assert!(families["rows"][0]["file"].is_null());
@@ -345,10 +354,12 @@ fn global_compiler_work_sums_units_and_preserves_evidence_boundaries() {
         )
         .unwrap();
     assert_eq!(members["total"], 3);
+    assert_eq!(members["summary"], families["summary"]);
     let compilers = store
         .compiler_work(&capture.id, CompilerWorkQuery::default())
         .unwrap();
     assert_eq!(compilers["total"], 4);
+    assert_eq!(compilers["summary"]["work_ms"], 197.0);
     assert_eq!(compilers["rows"][1]["compiler"], 1);
     let functions = store
         .compiler_work(
@@ -360,6 +371,7 @@ fn global_compiler_work_sums_units_and_preserves_evidence_boundaries() {
         )
         .unwrap();
     assert_eq!(functions["total"], 2);
+    assert_eq!(functions["summary"]["work_ms"], 5.0);
     assert_eq!(functions["rows"][0]["activity"], "OptFunction");
     assert_eq!(functions["rows"][0]["work_ms"], 4.0);
     let codegen = store
@@ -373,6 +385,7 @@ fn global_compiler_work_sums_units_and_preserves_evidence_boundaries() {
         )
         .unwrap();
     assert_eq!(codegen["total"], 1);
+    assert_eq!(codegen["summary"]["work_ms"], 1.0);
     assert_eq!(codegen["rows"][0]["work_ms"], 1.0);
     let evaluations = store
         .compiler_work(
@@ -384,6 +397,7 @@ fn global_compiler_work_sums_units_and_preserves_evidence_boundaries() {
         )
         .unwrap();
     assert_eq!(evaluations["total"], 2);
+    assert_eq!(evaluations["summary"]["work_ms"], 4.0);
     assert_eq!(evaluations["rows"][0]["name"], "");
     assert!(evaluations["timers"].as_array().unwrap().is_empty());
     let gcc = store
@@ -397,6 +411,7 @@ fn global_compiler_work_sums_units_and_preserves_evidence_boundaries() {
         )
         .unwrap();
     assert_eq!(gcc["total"], 0);
+    assert_eq!(gcc["summary"]["work_ms"], 0.0);
     assert_eq!(gcc["timers"][0]["work_ms"], 140.0);
     for literal in ["%", "_", "' OR 1=1 --"] {
         assert_eq!(
@@ -412,6 +427,27 @@ fn global_compiler_work_sums_units_and_preserves_evidence_boundaries() {
             0
         );
     }
+    for (text, work_ms) in [
+        ("Entity<int>", 122.0),
+        ("header.hpp", 127.0),
+        ("absent", 0.0),
+    ] {
+        let result = store
+            .compiler_work(&capture.id, CompilerWorkQuery { text, ..query() })
+            .unwrap();
+        assert_eq!(result["summary"]["work_ms"], work_ms);
+    }
+    let beyond_last_page = store
+        .compiler_work(
+            &capture.id,
+            CompilerWorkQuery {
+                offset: 100,
+                ..query()
+            },
+        )
+        .unwrap();
+    assert!(beyond_last_page["rows"].as_array().unwrap().is_empty());
+    assert_eq!(beyond_last_page["summary"], global["summary"]);
     let ascending = store
         .compiler_work(
             &capture.id,
@@ -423,6 +459,7 @@ fn global_compiler_work_sums_units_and_preserves_evidence_boundaries() {
         )
         .unwrap();
     assert_eq!(ascending["rows"][0]["work_ms"], 2.0);
+    assert_eq!(ascending["summary"], global["summary"]);
     assert!(
         store
             .compiler_work(
@@ -456,6 +493,7 @@ fn global_compiler_work_sums_units_and_preserves_evidence_boundaries() {
         .unwrap();
     let replaced = reopened.compiler_work(&capture.id, query()).unwrap();
     assert_eq!(replaced["rows"][0]["work_ms"], 93.0);
+    assert_eq!(replaced["summary"]["work_ms"], 93.0);
     assert_eq!(replaced["rows"][0]["count"], 3);
     let archive = root.join("global.buildscope");
     reopened.export(&capture.id, &archive, false).unwrap();

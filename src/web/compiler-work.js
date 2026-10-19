@@ -76,7 +76,8 @@ const CompilerWork = (() => {
       const total=coverage.reduce((sum,row)=>sum+row.units,0),traced=coverage.reduce((sum,row)=>sum+row.trace_units,0);
       $("#compiler-coverage").innerHTML='<p class="small muted">Named scope coverage: '+num(traced)+" / "+num(total)+' translation units in the selected inventory.</p><details><summary class="small">Measurement coverage</summary>'+coverage.map(row=>
         '<p class="small muted">'+esc(compilerLabel(row.compiler))+": "+num(row.profile_units)+" profiled / "+num(row.units)+" inventory units; "+num(row.trace_units)+" with named trace evidence"+(row.granularities_us!=null?"; thresholds: "+esc(row.granularities_us)+" µs":"")+".</p>").join("")+'</details>';
-      $("#compiler-results").innerHTML=(result.rows.length?table(entityColumns(true,base.families),result.rows,{action:"compiler-row",id:row=>result.rows.indexOf(row)}):
+      const summary='<p id="compiler-summary"><strong>Total matching inclusive work: '+(traced?time(result.summary.work_ms):"Unavailable")+'</strong> · '+num(result.total)+" "+(result.total===1?"result":"results")+'</p>';
+      $("#compiler-results").innerHTML=summary+(result.rows.length?table(entityColumns(true,base.families),result.rows,{action:"compiler-row",id:row=>result.rows.indexOf(row)}):
         '<div class="empty">'+(traced?"No matching recorded scopes. Try a different search, target, or activity.":"Named compiler scopes are unavailable for this selection. Collect a Clang profile to measure individual entities.")+'</div>')+pager(result,"compiler");
       $("#compiler-prev").onclick=()=>{offset=Math.max(0,offset-result.limit);load().catch(error=>toast(error.message));};
       $("#compiler-next").onclick=()=>{offset+=result.limit;load().catch(error=>toast(error.message));};
@@ -177,7 +178,8 @@ function compilerWorkExample(run,query,eventsForUnit) {
   const compare=(left,right)=>left<right?-1:left>right?1:0;
   const rows=[...groups.values()].map(({ids,...row})=>row).sort((a,b)=>direction*compare(a[column],b[column])||compare(a.key,b.key));
   const offset=Number(query.offset)||0,limit=Math.min(200,Math.max(1,Number(query.limit)||100));
-  return {rows:rows.slice(offset,offset+limit),total:rows.length,offset,limit,coverage,timers:[]};
+  const summary={work_ms:rows.reduce((sum,row)=>sum+row.work_ms,0)};
+  return {rows:rows.slice(offset,offset+limit),total:rows.length,summary,offset,limit,coverage,timers:[]};
 }
 
 /// Approximate template-argument elision shared by unit views and tour queries.

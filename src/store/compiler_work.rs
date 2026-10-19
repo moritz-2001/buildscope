@@ -84,7 +84,7 @@ impl Store {
             FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
             |context| Ok(display_family(&context.get::<String>(0)?)),
         )?;
-        // Keep coverage, total count, and the page on the same read snapshot while
+        // Keep coverage, summary, total count, and the page on the same read snapshot while
         // a recorder may be publishing the latest invocation for another unit.
         let connection = connection.unchecked_transaction()?;
         ensure!(
@@ -196,10 +196,12 @@ impl Store {
                     FROM selected GROUP BY unit",
             }
         };
-        let total: i64 = connection.query_row(
-            &format!("{cte} SELECT count(*) FROM ({grouped})"),
+        // Summarize all matching groups before pagination, using the same filters
+        // as the rows. GCC native timers remain outside named-scope work.
+        let (total, work_ms): (i64, f64) = connection.query_row(
+            &format!("{cte} SELECT count(*),coalesce(sum(work_ms),0.0) FROM ({grouped})"),
             parameters,
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let limit = query.limit.clamp(1, 200);
         let offset = query.offset.min(i64::MAX as usize);
@@ -220,7 +222,7 @@ impl Store {
                 "event":event.and_then(|value|serde_json::from_str::<Value>(&value).ok())}))
         })?.collect::<rusqlite::Result<_>>()?;
         Ok(
-            json!({"rows":rows,"total":total,"offset":offset,"limit":limit,"coverage":coverage,"timers":timers}),
+            json!({"rows":rows,"total":total,"summary":{"work_ms":work_ms},"offset":offset,"limit":limit,"coverage":coverage,"timers":timers}),
         )
     }
 }
