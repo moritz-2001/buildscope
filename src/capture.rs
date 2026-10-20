@@ -348,6 +348,15 @@ pub fn recover(store: &Store, id: &str) -> Result<Capture> {
     decode_invocations(store, &mut capture, false)?;
     capture.workload = Some(crate::workload::collect(&capture, &root));
     analysis::analyze(&mut capture, &explanation);
+    if let Ok(bytes) = fs::read(root.join("rebuild-evidence.json"))
+        && let Ok(saved) = serde_json::from_slice::<crate::rebuild::RebuildReport>(&bytes)
+    {
+        let mut report =
+            crate::rebuild::analyze(&capture, saved.previous, saved.comparisons, &explanation);
+        report.before_inputs = saved.before_inputs;
+        write_json(&root.join("rebuild-evidence.json"), &report)?;
+    }
+
     store.save(&capture)?;
     Ok(capture)
 }
@@ -475,7 +484,7 @@ fn execute(
 ) -> Result<(Capture, i32)> {
     let project = project::discover(&request.build_dir, &request.targets)?;
     let kind = if instrumented { "profile" } else { "record" };
-    let previous = store.previous(&project.configuration_id, kind, &request.targets)?;
+    let previous = rebuild_previous(store, &project, kind, &request.targets)?;
     let root_id = unique_id();
     let root = store.run_dir(&root_id)?;
     fs::create_dir_all(&root)?;
@@ -534,6 +543,32 @@ fn execute(
             .notes
             .push(format!("Workload command evidence unavailable: {error:#}"));
     }
+    let initial_comparisons = previous
+        .as_ref()
+        .map(|p| {
+            crate::rebuild::compare_stamps(
+                &p.inputs,
+                &before_inputs,
+                "previous-build",
+                p.inputs
+                    .keys()
+                    .chain(before_inputs.keys())
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter(),
+            )
+        })
+        .unwrap_or_default();
+    let mut initial_report = crate::rebuild::analyze(
+        &capture,
+        previous.as_ref().map(|p| p.id.clone()),
+        initial_comparisons,
+        "",
+    );
+    if !instrumented {
+        initial_report.before_inputs = before_inputs.clone();
+    }
+    write_json(&root.join("rebuild-evidence.json"), &initial_report)?;
     store.save(&capture)?;
     eprintln!("Buildscope {}: {}", kind, capture.id);
     let mut command = Command::new("ninja");
@@ -643,6 +678,37 @@ fn execute(
     capture.inputs.extend(project::snapshot(observed_paths));
     capture.workload = Some(crate::workload::collect(&capture, &root));
     analysis::analyze(&mut capture, &explanation);
+    let mut comparisons = initial_report.comparisons;
+    comparisons.extend(crate::rebuild::compare_stamps(
+        &before_inputs,
+        &capture.inputs,
+        "during-build",
+        before_paths
+            .into_iter()
+            .chain(capture.inputs.keys().cloned())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter(),
+    ));
+    let mut rebuild =
+        crate::rebuild::analyze(&capture, initial_report.previous, comparisons, &explanation);
+    if capture
+        .notes
+        .iter()
+        .any(|n| n.starts_with("Post-build inventory is partial"))
+    {
+        rebuild.eligible = false;
+        rebuild.candidates.clear();
+        rebuild.combined_work_ms = 0.0;
+        rebuild
+            .notes
+            .push("Post-build inventory is incomplete; candidates are unavailable.".into());
+    }
+    if !instrumented {
+        rebuild.before_inputs = before_inputs;
+    }
+    capture.findings.extend(crate::rebuild::findings(&rebuild));
+    write_json(&root.join("rebuild-evidence.json"), &rebuild)?;
+
     if capture
         .project
         .units
@@ -681,6 +747,31 @@ fn execute(
         capture.id
     );
     Ok((capture, code))
+}
+
+fn rebuild_previous(
+    store: &Store,
+    project: &ProjectSnapshot,
+    kind: &str,
+    targets: &[String],
+) -> Result<Option<Capture>> {
+    for row in store.list()? {
+        let Some(id) = row["id"].as_str() else {
+            continue;
+        };
+        if row["build_dir"].as_str() != Some(&project.build_dir) || !store.is_local(id)? {
+            continue;
+        }
+        let previous = store.load(id)?;
+        return Ok((previous.status == "success"
+            && previous.kind == kind
+            && previous.project.configuration_id == project.configuration_id
+            && previous.targets == targets
+            && previous.machine == machine_identity()
+            && previous.environment == compiler_environment())
+        .then_some(previous));
+    }
+    Ok(None)
 }
 
 fn copy_cache_key(key: &str, cache: &BTreeMap<String, String>) -> bool {

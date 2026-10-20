@@ -519,12 +519,16 @@ pub fn snapshot(paths: impl IntoIterator<Item = String>) -> BTreeMap<String, Fil
             let content = (metadata.len() <= 32 * 1024 * 1024)
                 .then(|| fs::read(&path).ok())
                 .flatten();
+            // Discard a hash if the file's observable metadata changed while reading.
+            let stable = fs::metadata(&path).ok().is_some_and(|after| {
+                after.len() == metadata.len() && after.modified().ok() == metadata.modified().ok()
+            });
             Some((
                 path,
                 FileStamp {
                     modified_ns,
                     size: metadata.len(),
-                    digest: content.map(digest),
+                    digest: content.filter(|_| stable).map(digest),
                 },
             ))
         })

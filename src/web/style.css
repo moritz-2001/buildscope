@@ -709,3 +709,8 @@ button:disabled { opacity:.45; cursor:default; }
 .workload-count i.cache_hits {background:var(--blue)}
 .workload-count i.unknown {background:var(--orange)}
 .workload-count i.up_to_date {background:#657681}
+
+/* Investigation controls and canvas keep geometry in script and honor the report CSP. */
+[data-flame="canvas"] { width:100%; height:auto; display:block; cursor:pointer; }
+.flamegraph-controls { display:flex; flex-wrap:wrap; gap:0.75rem; align-items:center; }
+.flamegraph-details { overflow-wrap:anywhere; }

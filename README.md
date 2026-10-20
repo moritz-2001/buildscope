@@ -422,3 +422,50 @@ appear as faster compilation. Ordinary recordings automatically collect build-lo
 ccache outcomes; unsupported caches and older captures retain unknown coverage.
 See [compilation history](docs/compilation-history.md) for collection and comparison
 semantics.
+
+
+## Header hotspots, rebuild candidates, and compiler flame graphs
+
+**Header hotspots** joins committed edit frequency with the selected capture's
+measured dependent compilation work. Collect Git history explicitly, anchored to
+the revision saved in a locally recorded capture:
+
+~~~sh
+buildscope analyze-history latest --days 180
+buildscope report latest
+~~~
+
+Choose a 30, 90, or 180 day window in Header hotspots. Complete managed profiles
+can rank headers by edits × associated compilation milliseconds. Partial profiles
+and ordinary recordings show known costs and coverage; incomplete history does
+not receive a complete priority score. History uses first-parent content changes,
+records detected renames, and excludes uncommitted edits. Reports and imported
+archives use the saved analysis without querying Git or fetching history.
+See [header hotspot semantics](docs/header-hotspots.md).
+
+**Rebuild candidates** is populated by new ordinary recordings. It retains before
+and after fingerprints, timestamp-only changes, unchanged generated-output churn,
+native Ninja explanations, and associated actions. These are candidates for
+inspection: other input changes, commands, or timestamp-sensitive compilation can
+still require rebuilding. Combined associated work deduplicates shared actions
+and is not an elapsed-time savings estimate. Older captures retain an explicit
+unavailable state. See [rebuild evidence](docs/rebuild-detector.md).
+
+**Flame graph** is available in each compilation investigation and in Compiler
+work's table/graph switch. Top-down and bottom-up views aggregate recorded Clang
+temporal stacks, preserve compiler/source identities, and attribute each covered
+interval once per process/thread lane. Graph width is additive recorded lane work;
+existing compiler-work tables continue showing overlapping inclusive scope totals.
+Search highlights scopes without changing their ancestry or graph width. GCC native
+aggregate timers remain separate.
+
+Existing captures can build the optional graph projection explicitly:
+
+~~~sh
+buildscope reindex latest --compiler-stacks
+~~~
+
+New captures and imports index their stacks alongside events. The database upgrade
+creates the new projection tables without scanning old traces. Saved evidence and
+analysis artifacts travel with normal capture export/import. See
+[compiler flame graphs](docs/compiler-flames.md).

@@ -66,7 +66,7 @@ fn legacy_rows_become_typed_queries_without_changing_json() {
         let before = json_snapshot(&database);
         let store = Store::open(temp.path()).unwrap();
         assert_eq!(json_snapshot(&database), before);
-        assert_eq!(database_version(&database), 2);
+        assert_eq!(database_version(&database), 3);
         let target: String = database
             .query_row(
                 "SELECT target FROM report_units WHERE unit='clang'",
@@ -226,7 +226,7 @@ fn failed_backfills_roll_back_schema_version_and_all_original_rows() {
                 .unwrap();
         }
         Store::open(temp.path()).unwrap();
-        assert_eq!(database_version(&database), 2);
+        assert_eq!(database_version(&database), 3);
     }
 }
 
@@ -235,9 +235,9 @@ fn fresh_newer_and_unrecognized_databases_have_explicit_version_handling() {
     let temp = tempfile::tempdir().unwrap();
     Store::open(temp.path()).unwrap();
     let database = Connection::open(temp.path().join("index.sqlite3")).unwrap();
-    assert_eq!(database_version(&database), 2);
+    assert_eq!(database_version(&database), 3);
     let before = schema_snapshot(&database);
-    database.pragma_update(None, "user_version", 3).unwrap();
+    database.pragma_update(None, "user_version", 4).unwrap();
     assert!(
         Store::open(temp.path())
             .err()
@@ -245,7 +245,7 @@ fn fresh_newer_and_unrecognized_databases_have_explicit_version_handling() {
             .to_string()
             .contains("newer Buildscope")
     );
-    assert_eq!(database_version(&database), 3);
+    assert_eq!(database_version(&database), 4);
     assert_eq!(schema_snapshot(&database), before);
     let other = tempfile::tempdir().unwrap();
     let database = Connection::open(other.path().join("index.sqlite3")).unwrap();
@@ -317,7 +317,7 @@ fn openers_wait_beyond_the_normal_timeout_for_a_migration_writer() {
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
         json!([])
     );
-    assert_eq!(database_version(&database), 2);
+    assert_eq!(database_version(&database), 3);
     assert_eq!(json_snapshot(&database), original_json);
 }
 
@@ -346,7 +346,7 @@ fn concurrent_openers_apply_the_migration_only_once() {
         .map(|thread| thread.join().unwrap())
         .collect();
     assert_eq!(results[0], results[1]);
-    assert_eq!(database_version(&database), 2);
+    assert_eq!(database_version(&database), 3);
     assert_eq!(json_snapshot(&database), before);
 }
 

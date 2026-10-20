@@ -1,0 +1,3 @@
+const test=require('node:test');const assert=require('node:assert/strict');const {layout,matches}=require('../src/web/flamegraph.js');
+test('additive widths and source highlighting preserve geometry',()=>{const tree={name:'root',value_us:100,children:[{name:'InstantiateFunction',detail:'Foo<int>',file:'foo.hpp',value_us:60},{name:'Other',value_us:30}]};const before=layout(tree,1000);assert.equal(before[1].w,600);assert.equal(before[2].x,600);assert.equal(before[2].w,300);assert(matches(tree.children[0],'FOO.HPP'));assert(!matches(tree.children[1],'FOO'));assert.deepEqual(layout(tree,1000),before);});
+test('empty capture layout stays finite',()=>{assert.deepEqual(layout(null,1000),[]);const result=layout({value_us:0,children:[]},300);assert.equal(result[0].w,300);});

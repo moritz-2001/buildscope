@@ -32,7 +32,7 @@ impl MigrationProgress {
             started: Instant::now(),
         }));
         eprintln!(
-            "Buildscope migration: upgrading the entire database to version 2; original JSON is retained."
+            "Buildscope migration: upgrading the entire database to version 3; original JSON is retained."
         );
         eprintln!("Buildscope migration: waiting for database write access...");
         let (stop, receiver) = mpsc::channel();

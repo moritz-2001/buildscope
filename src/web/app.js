@@ -10,6 +10,8 @@ const date = value => new Date(value).toLocaleString();
 const state = {run:null,runs:[],view:"overview",q:"",scope:"all",target:"all",sort:"processing_ms",descending:true,detail:null};
 let generation = 0;
 let comparisonGeneration = 0;
+let compilerFlameView = null;
+let detailFlameView = null;
 const profileByUnit = new Map();
 const unitById = new Map();
 const actionWork = new Map();
@@ -151,8 +153,9 @@ function findingsHTML(findings) {
 }
 function render(comparisonSelection = null) {
   if(!state.run)return;
+  compilerFlameView?.destroy();compilerFlameView=null;
   const run=state.run, launcher=run.kind==="launcher";
-  const titles={overview:"Understand the wait.",headers:"Which headers create work?",compiler:"Compiler work",units:"Why is this file expensive?",history:"Compilation time over time.",compare:"Measure what changed."};
+  const titles={overview:"Understand the wait.",headers:"Which headers create work?",hotspots:"Which headers deserve attention?",rebuilds:"Could this rebuilding be avoided?",compiler:"Compiler work",units:"Why is this file expensive?",history:"Compilation time over time.",compare:"Measure what changed."};
   $("#title").textContent=titles[state.view];
   $("#breadcrumb").textContent=state.view==="units"?"COMPILATION UNITS":state.view.toUpperCase();
   $("#status").textContent=(BuildscopeTour.active?"Example data · ":"")+run.status+" · "+run.kind; $("#status").className="badge "+run.status;
@@ -181,9 +184,14 @@ function render(comparisonSelection = null) {
     html='<p class="muted">Reach, processing cost, and rebuild impact describe different kinds of work.</p>'+toolbar("Filter headers by path…")+
       notes(["Processing totals cover the entire capture; target selection narrows reach and rebuilt work. Inclusive costs overlap. Reach comes from the available dependency inventory; direct counts describe recorded includes. Historical triggers count matching configurations and requested target sets; ordinary builds are separate from profiles."])+
       table(headerColumns(),sortRows(headerRows()),{action:"header",id:h=>h.path});
+  } else if(state.view==="hotspots") {
+    html=HeaderHotspots.shell();
+  } else if(state.view==="rebuilds") {
+    html=RebuildDetector.shell();
   } else if(state.view==="compiler") {
     if(!["work","units","count","longest","name"].includes(state.sort))state.sort="work";
-    html=CompilerWork.shell();
+    html='<div class="tabs" aria-label="Compiler work presentation"><button id="compiler-mode-table" class="'+(state.compilerMode!=="flamegraph"?"active":"")+'">Table</button><button id="compiler-mode-flamegraph" class="'+(state.compilerMode==="flamegraph"?"active":"")+'">Flame graph</button></div>'+
+      (state.compilerMode==="flamegraph"?'<div id="compiler-flamegraph"></div>':CompilerWork.shell());
   } else if(state.view==="units") {
     html='<p class="muted">Inspect the compiler activity behind an expensive compilation.</p>'+toolbar("Filter source files or unit IDs…")+
       notes(["Unexecuted units have no action timing in this run. Compiler phase/subphase measurements may overlap."])+
@@ -198,7 +206,13 @@ function render(comparisonSelection = null) {
   }
   $("#content").innerHTML=html;
   bindFilters();
-  if(state.view==="compiler")CompilerWork.load().catch(error=>toast(error.message));
+  if(state.view==="hotspots")HeaderHotspots.bind();
+  if(state.view==="rebuilds")RebuildDetector.load().catch(error=>toast(error.message));
+  if(state.view==="compiler") {
+    for(const mode of ["table","flamegraph"])$("#compiler-mode-"+mode).onclick=()=>{state.compilerMode=mode;render();};
+    if(state.compilerMode==="flamegraph")compilerFlameView=CompilerFlames.mount($("#compiler-flamegraph"),{target:state.target==="all"?"":state.target,compiler:state.compilerIdentity||""});
+    else CompilerWork.load().catch(error=>toast(error.message));
+  }
   if(state.view==="overview") drawBuildTimeline();
   if(state.view==="history") BuildHistory.bind();
   if(state.view==="compare") {
@@ -263,6 +277,7 @@ function indexRun(run) {
   run.actions.forEach(a=>{if(a.unit_id)actionWork.set(a.unit_id,(actionWork.get(a.unit_id)||0)+a.end_ms-a.start_ms);});
 }
 function modal(html) {
+  detailFlameView?.destroy();detailFlameView=null;
   $("#detail-body").innerHTML=html;
   if(!$("#detail").open)$("#detail").showModal();
   BuildscopeTour.mount();
@@ -325,14 +340,16 @@ async function openUnit(id,tab="summary") {
   const unit=unitById.get(id);
   const profile=profileByUnit.get(id);
   state.detail={type:"unit",id,tab};
-  const tabs=[["summary","Summary"],["templates","Templates"],["functions","Functions"],["evaluations","Constant evaluation"],["includes","Includes"],["trace","Trace events"],["command","Command"]];
+  const tabs=[["summary","Summary"],["templates","Templates"],["functions","Functions"],["evaluations","Constant evaluation"],["includes","Includes"],["trace","Trace events"],["flamegraph","Flame graph"],["command","Command"]];
   modal('<p class="eyebrow">COMPILATION INVESTIGATION · '+esc(state.run.project.compilers[unit.compiler]?.family)+'</p>'+
     '<h2 class="detail-title">'+esc(unit.source_key)+'</h2><p class="detail-meta">'+esc(unit.id)+" · "+esc(unit.output_key)+'</p>'+
     '<div class="toolbar">'+sourceButton(unit.source)+'<button class="action" data-action="copy-profile" data-id="'+esc(id)+'"'+(BuildscopeTour.active?' disabled title="Available for recorded captures"':"")+'>Copy full investigation command</button>'+
     (profile?artifactLink(profile.artifact):"")+'</div><div class="tabs">'+tabs.map(([key,label])=>
       '<button data-action="unit-tab" data-id="'+esc(id)+'" data-tab="'+key+'" class="'+(tab===key?"active":"")+'">'+label+'</button>').join("")+'</div><div id="unit-detail"></div>');
   const container=$("#unit-detail");
-  if(tab==="command") {
+  if(tab==="flamegraph") {
+    detailFlameView=CompilerFlames.mount(container,{unit:id,compiler:String(unit.compiler)});
+  } else if(tab==="command") {
     container.innerHTML='<h3>Original compilation arguments</h3><pre class="evidence">'+esc(unit.arguments.map(shellQuote).join(" "))+'</pre>'+
       '<p class="muted small">Working directory: '+esc(unit.directory)+'</p><h3>Compiler identity</h3><pre class="evidence">'+
       esc(state.run.project.compilers[unit.compiler]?.version)+'</pre>'+
@@ -512,6 +529,7 @@ document.addEventListener("click",async event=>{
     else if(action==="compiler-row")await CompilerWork.open(Number(id));
     else if(action==="compiler-member")await CompilerWork.member(Number(id));
     else if(action==="compiler-scope")await CompilerWork.scope(Number(id));
+    else if(action==="header-hotspot")await HeaderHotspots.detail(id);
     else if(action==="header")await openHeader(id);
     else if(action==="unit")await openUnit(id);
     else if(action==="unit-tab")await openUnit(id,button.dataset.tab);
@@ -543,8 +561,8 @@ document.querySelectorAll("nav button").forEach(button=>button.onclick=()=>{
   state.view=button.dataset.view;state.q="";state.sort=["units","compiler"].includes(state.view)?"work":"processing_ms";state.descending=true;
   history.replaceState(null,"",BuildscopeTour.active?"?tour=1#"+state.view:"?run="+encodeURIComponent(state.run.id)+"#"+state.view);render();window.scrollTo(0,0);
 });
-$("#close-detail").onclick=()=>{$("#detail").close();state.detail=null;};
-$("#detail").addEventListener("cancel",()=>state.detail=null);
+$("#close-detail").onclick=()=>{$("#detail").close();state.detail=null;detailFlameView?.destroy();detailFlameView=null;};
+$("#detail").addEventListener("cancel",()=>{state.detail=null;detailFlameView?.destroy();detailFlameView=null;});
 $(".brand").onclick=e=>{e.preventDefault();state.view="overview";render();window.scrollTo(0,0);};
 $("#run").onchange=e=>loadRun(e.target.value).catch(error=>toast(error.message));
 window.addEventListener("resize",()=>{if(state.view==="overview")drawBuildTimeline();});
@@ -566,7 +584,7 @@ $("#start-tour").disabled=true;
   try{
     const result=await api("/api/runs");state.runs=result.runs;state.store=result.store;
     $("#run").innerHTML=runOptions(result.initial);
-    const view=location.hash.slice(1);if(["overview","headers","compiler","units","history","compare"].includes(view))state.view=view;
+    const view=location.hash.slice(1);if(["overview","headers","hotspots","rebuilds","compiler","units","history","compare"].includes(view))state.view=view;
     if(result.initial)await loadRun(new URLSearchParams(location.search).get("run")||result.initial);
     else showWelcome();
   }catch(error){showWelcome();toast(error.message);}

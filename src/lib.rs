@@ -17,3 +17,7 @@ pub mod util;
 mod decoder;
 mod worker_pool;
 mod workload;
+
+pub mod compiler_stacks;
+pub mod header_history;
+pub mod rebuild;

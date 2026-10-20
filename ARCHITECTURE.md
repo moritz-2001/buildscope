@@ -420,3 +420,53 @@ scenario/date filters, baseline selection, and capture/comparison drill-down.
 Failed captures break the duration line and cannot contribute to deltas. Tests
 cover pure series semantics, legacy serialization, real Ninja clean/no-op/partial
 builds, real ccache miss/hit cycles, and archive round trips.
+
+
+## Header edit history and hotspots
+
+[`header_history.rs`](src/header_history.rs) separates explicit local Git effects
+from pure joins. `Store::analyze_history` collects first-parent history anchored to
+the saved capture commit and observation time. It atomically saves versioned
+`header-history.json`; complete cached windows can serve shorter requests.
+Incomplete local history can be collected again after the local repository is
+deepened. Reports never run Git or resolve imported source paths to obtain history.
+`Store::header_hotspots` joins this evidence to selected dependent-unit action work
+and compiler measurements, then pages the ranking. Only complete managed profiling
+coverage receives a complete priority score. Costs remain associated compilation
+work, without exclusive attribution or predicted savings.
+
+## Potentially avoidable rebuilds
+
+[`rebuild.rs`](src/rebuild.rs) consumes saved fingerprint boundaries and native
+Ninja explanations. Collection retains `rebuild-evidence.json` before execution
+for recovery, then publishes completed comparisons and candidate findings after
+ordinary-build analysis. Previous-build comparisons require a compatible local
+predecessor from the same build tree. Missing hashes, unknown modification times,
+newly discovered files, profiles, and partial builds cannot establish an unchanged
+input that required no rebuilding. Stable hashing in `project::snapshot` discards
+the digest if observable metadata changes while the file is read.
+The report omits the full recovery baseline from its initial response but retains
+changed comparisons, candidate/action associations, and a deduplicated work union.
+Recovery reads saved evidence and does not fingerprint today's filesystem.
+
+## Compiler stack projections
+
+[`compiler_stacks.rs`](src/compiler_stacks.rs) sweeps recorded intervals within
+each compiler lane and derives a compact prefix trie of additive terminal weights.
+Crossing scopes produce explicit ambiguity buckets under their common enclosing
+prefix. Gaps within a recorded scope remain recorded self work; absent short scopes
+are not reconstructed. Compiler temporal nesting is not a semantic call graph.
+[`store/flamegraph.rs`](src/store/flamegraph.rs) replaces each unit projection inside
+the event-index transaction, merges selected projections, and returns bounded
+focused graph data with omitted mass preserved. Compiler identities and exact
+activity/spelling/source variants remain separate. The SQLite projection schema
+upgrades independently from portable captures; old traces are backfilled only by
+explicit `reindex --compiler-stacks`, with progress outside measured build time.
+The browser's [`flamegraph.js`](src/web/flamegraph.js) draws only the bounded result,
+provides keyboard selection and evidence drilldowns, and highlights search results
+without changing totals. Unit and project views dispose their observers and stale
+requests when replaced.
+
+All three investigations keep optional versioned evidence separate from the
+schema-1 capture manifest. `store/investigations.rs` validates and reads the saved
+artifacts; archive exchange preserves them. The loopback report API remains GET-only.

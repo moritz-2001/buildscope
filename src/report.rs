@@ -2,7 +2,7 @@
 //! large traces out of the initial browser payload.
 use crate::{
     analysis,
-    store::{CompilerWorkQuery, EventQuery, Store},
+    store::{CompilerWorkQuery, EventQuery, FlamegraphQuery, HeaderHotspotQuery, Store},
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -103,6 +103,18 @@ fn handle(
             include_bytes!("web/compiler-work.js"),
             "text/javascript; charset=utf-8",
         )),
+        "/header-hotspots.js" => Ok(asset(
+            include_bytes!("web/header-hotspots.js"),
+            "text/javascript; charset=utf-8",
+        )),
+        "/rebuild-detector.js" => Ok(asset(
+            include_bytes!("web/rebuild-detector.js"),
+            "text/javascript; charset=utf-8",
+        )),
+        "/flamegraph.js" => Ok(asset(
+            include_bytes!("web/flamegraph.js"),
+            "text/javascript; charset=utf-8",
+        )),
         "/history.js" => Ok(asset(
             include_bytes!("web/history.js"),
             "text/javascript; charset=utf-8",
@@ -166,6 +178,70 @@ fn handle(
                         descending: value("descending") != "false",
                         offset: value("offset").parse().unwrap_or(0),
                         limit: value("limit").parse().unwrap_or(100),
+                    },
+                )?,
+                200,
+            ))
+        }
+        "/api/header-hotspots" => {
+            let value = |key: &str| query.get(key).map(String::as_str).unwrap_or("");
+            Ok(json_response(
+                store.header_hotspots(
+                    required(&query, "run")?,
+                    HeaderHotspotQuery {
+                        days: query
+                            .get("days")
+                            .map(|s| s.parse())
+                            .transpose()?
+                            .unwrap_or(90),
+                        target: value("target"),
+                        text: value("q"),
+                        path: value("path"),
+                        offset: query
+                            .get("offset")
+                            .map(|s| s.parse())
+                            .transpose()?
+                            .unwrap_or(0),
+                        limit: query
+                            .get("limit")
+                            .map(|s| s.parse())
+                            .transpose()?
+                            .unwrap_or(100),
+                    },
+                )?,
+                200,
+            ))
+        }
+        "/api/rebuilds" => Ok(json_response(
+            store.rebuild_analysis(required(&query, "run")?)?,
+            200,
+        )),
+        "/api/compiler-flamegraph" => {
+            let value = |key: &str| query.get(key).map(String::as_str).unwrap_or("");
+            Ok(json_response(
+                store.compiler_flamegraph(
+                    required(&query, "run")?,
+                    FlamegraphQuery {
+                        unit: value("unit"),
+                        target: value("target"),
+                        compiler: value("compiler"),
+                        direction: value("direction"),
+                        focus: value("focus"),
+                        depth: query
+                            .get("depth")
+                            .map(|s| s.parse())
+                            .transpose()?
+                            .unwrap_or(8),
+                        offset: query
+                            .get("offset")
+                            .map(|s| s.parse())
+                            .transpose()?
+                            .unwrap_or(0),
+                        limit: query
+                            .get("limit")
+                            .map(|s| s.parse())
+                            .transpose()?
+                            .unwrap_or(1000),
                     },
                 )?,
                 200,

@@ -241,6 +241,37 @@ pub fn run() -> Result<i32> {
             println!("Imported {}", store.import(&archive)?);
             Ok(0)
         }
+        Commands::AnalyzeHistory { run, days, json } => {
+            let history = store.analyze_history(&run, days)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&history)?);
+            } else {
+                println!(
+                    "Saved committed history for {} headers through {} ({}). Open with: buildscope report {}",
+                    history.files.len(),
+                    history.anchor,
+                    if history.complete {
+                        "complete local history"
+                    } else {
+                        "partial local history"
+                    },
+                    store.resolve_id(&run)?
+                );
+            }
+            Ok(0)
+        }
+        Commands::Reindex {
+            run,
+            compiler_stacks,
+        } => {
+            anyhow::ensure!(
+                compiler_stacks,
+                "select --compiler-stacks to rebuild flame-graph projections"
+            );
+            let units = store.reindex_compiler_stacks(&run)?;
+            println!("Indexed compiler stacks for {units} compilation units");
+            Ok(0)
+        }
         Commands::Recover { run } => {
             println!("Recovered {}", capture::recover(&store, &run)?.id);
             Ok(0)
@@ -363,6 +394,22 @@ enum Commands {
     },
     /// Import a capture archive, rebuilding its searchable event index.
     Import { archive: PathBuf },
+    /// Save first-parent committed-header history anchored to a local capture's revision.
+    AnalyzeHistory {
+        #[arg(default_value = "latest")]
+        run: String,
+        #[arg(long, default_value_t = 90)]
+        days: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rebuild optional derived investigation indexes from retained compiler evidence.
+    Reindex {
+        #[arg(default_value = "latest")]
+        run: String,
+        #[arg(long)]
+        compiler_stacks: bool,
+    },
     /// Finalize retained artifacts from an interrupted recorder without running a build.
     Recover {
         #[arg(default_value = "latest")]

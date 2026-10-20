@@ -10,7 +10,7 @@ mod progress;
 use progress::MigrationProgress;
 
 // The database evolves independently of model::SCHEMA_VERSION (portable captures).
-const DATABASE_VERSION: u32 = 2;
+const DATABASE_VERSION: u32 = 3;
 const STARTUP_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Initialize new stores or atomically upgrade existing projections under one writer lock.
@@ -59,6 +59,7 @@ pub(super) fn initialize(mut connection: Connection) -> Result<()> {
     }
     transaction.execute_batch(PHASE_SCHEMA)?;
     transaction.execute_batch(COMMON_SCHEMA)?;
+    transaction.execute_batch(COMPILER_STACK_SCHEMA)?;
     transaction.pragma_update(None, "user_version", DATABASE_VERSION)?;
     if let Some(progress) = &progress {
         progress.stage("Committing database upgrade (disk writes may take a while)");
@@ -373,3 +374,12 @@ const COMMON_SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS include_paths(run TEXT NOT NULL,path TEXT NOT NULL,
         chain TEXT NOT NULL,unit TEXT NOT NULL,PRIMARY KEY(run,path,chain,unit));
     CREATE INDEX IF NOT EXISTS unit_target ON report_units(run,target,unit);";
+
+// Compact terminal stack projection. A marker exists even for empty traces;
+// absent markers on older captures are explicit and never trigger startup scans.
+const COMPILER_STACK_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS compiler_stack_units(
+ run TEXT NOT NULL, unit TEXT NOT NULL, PRIMARY KEY(run,unit));
+CREATE TABLE IF NOT EXISTS compiler_stacks(
+ run TEXT NOT NULL,unit TEXT NOT NULL,ordinal INTEGER NOT NULL,data TEXT NOT NULL,
+ PRIMARY KEY(run,unit,ordinal));";

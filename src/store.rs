@@ -12,8 +12,12 @@ use std::{
 };
 
 mod compiler_work;
+mod flamegraph;
+mod investigations;
 mod schema;
 pub use compiler_work::CompilerWorkQuery;
+pub use flamegraph::FlamegraphQuery;
+pub use investigations::HeaderHotspotQuery;
 
 /// A local capture repository. Connections are short-lived so reports can read while
 /// another process finalizes a capture.
@@ -412,6 +416,7 @@ impl Store {
                 ])?;
             }
         }
+        flamegraph::index_events(&transaction, run, unit, events)?;
         transaction.commit()?;
         Ok(())
     }
@@ -818,6 +823,7 @@ impl Store {
             "unsupported archive version"
         );
         validate_id(&capture.id)?;
+        investigations::validate_optional_analyses(staging)?;
         // Validate streams before installing a finished imported capture.
         let staged_events = staging.join("events");
         if staged_events.exists() {
@@ -917,4 +923,9 @@ fn append_bytes<W: Write>(archive: &mut tar::Builder<W>, name: &str, bytes: &[u8
     header.set_cksum();
     archive.append_data(&mut header, name, bytes)?;
     Ok(())
+}
+
+/// Shared target interpretation used by capture-level investigation queries.
+pub(crate) fn target_name(output: &str) -> &str {
+    schema::target_for(output)
 }
