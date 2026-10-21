@@ -89,10 +89,14 @@ CMake targets:
 
 ~~~cmake
 find_program(BUILDSCOPE_EXECUTABLE NAMES buildscope REQUIRED)
-set(CMAKE_CXX_COMPILER_LAUNCHER
-    "${BUILDSCOPE_EXECUTABLE};launch;--build-dir;${CMAKE_BINARY_DIR};--")
-set(CMAKE_C_COMPILER_LAUNCHER "${CMAKE_CXX_COMPILER_LAUNCHER}")
+foreach(language IN ITEMS C CXX)
+  list(PREPEND CMAKE_${language}_COMPILER_LAUNCHER
+       "${BUILDSCOPE_EXECUTABLE}" launch --build-dir "${CMAKE_BINARY_DIR}" --)
+endforeach()
 ~~~
+
+This prepends Buildscope to each language's existing launcher, preserving ccache
+and its options when it is already configured.
 
 Alternatively, configure an existing project from the command line:
 
@@ -104,6 +108,28 @@ cmake --build build --parallel
 buildscope collect --build-dir build --label development
 buildscope report latest
 ~~~
+
+For a ccache build, keep ccache after Buildscope's `--` separator:
+
+~~~sh
+cmake -S . -B build -G Ninja \
+  '-DCMAKE_CXX_COMPILER_LAUNCHER=/absolute/path/buildscope;launch;--;/absolute/path/ccache' \
+  '-DCMAKE_C_COMPILER_LAUNCHER=/absolute/path/buildscope;launch;--;/absolute/path/ccache'
+~~~
+
+The ccache integration requires ccache 4.8 or newer. Buildscope uses its
+compiler-prefix hook to collect Clang/GCC details only when ccache runs the
+compiler. Cache hits remain hits, including entries populated
+before enabling Buildscope, and create no compiler observations. Instrumentation
+flags and per-invocation trace paths are added after cache lookup. Existing ccache
+settings, inline `KEY=VALUE` options, and compiler prefixes from `CCACHE_PREFIX` or
+configuration files are preserved. The local hook also supports executable and
+build paths containing spaces. Keep Buildscope first; the reverse chain
+`ccache buildscope launch ...` makes ccache parse Buildscope as the compiler.
+
+Run `collect` for compiler details from misses. An all-hit build creates no new
+launcher capture. Use `record` for the complete build timeline and cache-hit counts;
+it leaves miss details in the launcher spool for separate collection.
 
 The launcher discovers the root Ninja directory from its working-directory
 ancestors; `--build-dir` makes the root explicit for unusual invocation layouts.
@@ -117,8 +143,8 @@ response-file contents, diagnostics, exit codes, include relationships, and
 profiling artifacts are retained. Public GCC launching preserves native text
 diagnostics. Compiler configuration checks pass through without capture; the
 build outputs remain in the original build tree and existing cache environment
-settings are preserved. Install Buildscope directly before the actual Clang/GCC
-executable; arbitrary compiler-cache/launcher chains are forwarded without
+settings are preserved. Buildscope supports direct Clang/GCC commands and
+`ccache COMPILER ...`; other compiler-cache/launcher chains are forwarded without
 compiler detail when their executable cannot be identified.
 
 Run `collect` after each build, including failed builds, and before reconfiguring
@@ -145,6 +171,34 @@ rebuild explanations; use a managed `profile` when you want isolated, fresh
 compiler measurements. Launcher instrumentation adds overhead to normal builds.
 If a public launcher is configured, `record` observes that existing instrumentation
 and leaves its compiler detail in the spool for separate collection.
+
+### Optional setup for libraries that configure ccache globally
+
+If your libraries already enable ccache through the global
+`RULE_LAUNCH_COMPILE` property, keep their setup and add this at the end of your
+top-level `CMakeLists.txt`, after all `add_subdirectory()` and
+`FetchContent_MakeAvailable()` calls:
+
+~~~cmake
+find_program(BUILDSCOPE_EXECUTABLE NAMES buildscope)
+
+if(BUILDSCOPE_EXECUTABLE)
+  get_property(_launcher GLOBAL PROPERTY RULE_LAUNCH_COMPILE)
+  set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE
+    "\"${BUILDSCOPE_EXECUTABLE}\" launch -- ${_launcher}")
+endif()
+~~~
+
+When Buildscope is found, this wraps the existing global ccache command as
+`buildscope launch -- ccache COMPILER ...`. Otherwise the libraries' ccache setup
+is unchanged. Cache misses produce compiler details; cache hits remain cached
+and create no compiler observations. Normal Ninja builds discover the build
+directory automatically.
+
+Use this setup instead of the `CMAKE_<LANG>_COMPILER_LAUNCHER` examples above;
+combining them can add duplicate launchers. This recipe assumes the libraries
+set the global rule only; directory or target `RULE_LAUNCH_COMPILE` overrides
+still take precedence.
 
 ## What each compiler supplies
 

@@ -8,7 +8,6 @@ use std::{
     fs,
     io::Read,
     path::Path,
-    process::Command,
 };
 
 /// Freeze command classification and ccache prefix configuration before execution.
@@ -21,9 +20,10 @@ pub(crate) fn prepare(capture: &Capture, root: &Path) -> Result<()> {
         let Some(command) = capture.project.commands.get(&unit.output) else {
             continue;
         };
-        let Some(arguments) = shlex::split(command) else {
+        let Some(mut arguments) = shlex::split(command) else {
             continue;
         };
+        strip_buildscope_launcher(&mut arguments);
         let is_direct = |arg: &String, compilers: &mut BTreeMap<_, _>| {
             *compilers
                 .entry((arg.clone(), unit.directory.clone()))
@@ -34,25 +34,15 @@ pub(crate) fn prepare(capture: &Capture, root: &Path) -> Result<()> {
             .is_some_and(|arg| is_direct(arg, &mut compilers))
         {
             CommandKind::Direct
-        } else if arguments
-            .first()
-            .is_some_and(|arg| executable_name(arg) == "ccache")
-            && arguments
-                .get(1)
-                .is_some_and(|arg| is_direct(arg, &mut compilers))
+        } else if let Some(index) = ccache_compiler_index(&arguments)
+            && is_direct(&arguments[index], &mut compilers)
         {
             let plain = *prefixes
-                .entry((arguments[0].clone(), unit.directory.clone()))
+                .entry((arguments[..index].to_vec(), unit.directory.clone()))
                 .or_insert_with(|| {
                     ["prefix_command", "prefix_command_cpp"].iter().all(|key| {
-                        Command::new(&arguments[0])
-                            .args(["--get-config", key])
-                            .current_dir(&unit.directory)
-                            .output()
-                            .is_ok_and(|output| {
-                                output.status.success()
-                                    && output.stdout.iter().all(u8::is_ascii_whitespace)
-                            })
+                        ccache_config(&arguments, index, key, Path::new(&unit.directory))
+                            .is_ok_and(|value| value.bytes().all(|byte| byte.is_ascii_whitespace()))
                     })
                 });
             CommandKind::Ccache { plain }

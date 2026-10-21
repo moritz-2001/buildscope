@@ -8,6 +8,20 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+/// Recognize ccache's prefix form, including its optional KEY=VALUE settings.
+/// Other wrappers and ccache administrative options are passed through unchanged.
+pub(crate) fn ccache_compiler_index(arguments: &[String]) -> Option<usize> {
+    if Path::new(arguments.first()?).file_name()?.to_str()? != "ccache" {
+        return None;
+    }
+    let index = (1..arguments.len()).find(|&index| {
+        !arguments[index].split_once('=').is_some_and(|(key, _)| {
+            !key.is_empty() && key.bytes().all(|c| c.is_ascii_lowercase() || c == b'_')
+        })
+    })?;
+    (!arguments[index].starts_with('-')).then_some(index)
+}
+
 /// Wall-clock milliseconds for history ordering, never for measuring durations.
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -142,4 +156,44 @@ pub fn output_argument(arguments: &[String]) -> Option<String> {
                     .map(str::to_owned)
             })
         })
+}
+
+/// Remove only Buildscope instrumentation when classifying the remaining command.
+pub(crate) fn strip_buildscope_launcher(arguments: &mut Vec<String>) {
+    if Path::new(arguments.first().map(String::as_str).unwrap_or(""))
+        .file_name()
+        .is_some_and(|name| name == "buildscope")
+    {
+        if arguments.get(1).is_some_and(|arg| arg == "__launch") {
+            arguments.drain(..2);
+        } else if arguments.get(1).is_some_and(|arg| arg == "launch")
+            && let Some(separator) = arguments.iter().position(|arg| arg == "--")
+        {
+            arguments.drain(..=separator);
+        }
+    }
+}
+
+/// Query the effective ccache setting, respecting its inline override precedence.
+pub(crate) fn ccache_config(
+    arguments: &[String],
+    compiler_index: usize,
+    key: &str,
+    directory: &Path,
+) -> Result<String> {
+    if let Some(value) = arguments[1..compiler_index]
+        .iter()
+        .rev()
+        .find_map(|argument| argument.strip_prefix(&format!("{key}=")))
+    {
+        return Ok(value.to_owned());
+    }
+    let output = checked(
+        Command::new(&arguments[0])
+            .args(["--get-config", key])
+            .current_dir(directory),
+    )?;
+    Ok(String::from_utf8(output.stdout)?
+        .trim_end_matches(['\r', '\n'])
+        .to_owned())
 }

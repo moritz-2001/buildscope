@@ -153,6 +153,18 @@ Compiler identity probes are cached by executable path, modification time, and
 size. Arguments remain vectors; response files are read before the compiler can
 remove them. Configuration probes pass through without creating observations.
 
+For `launch -- ccache [KEY=VALUE ...] COMPILER ...`, the outer launcher delegates
+lookup to ccache with the native compiler and original flags. A process-local
+`prefix_command` override invokes Buildscope's internal `__ccache_launch` only
+when ccache executes the compiler. That hook adds instrumentation and writes the
+usual observations; cache hits write none. A build-local symlink found through
+the child's PATH avoids ccache's space-delimited prefix parsing of executable
+paths. Serialized child-only context retains the build root, detail level, and
+effective original compiler prefix, which still wraps the instrumented compiler.
+The hook removes its private context before executing that prefix or compiler.
+No shared cache configuration is changed. Ordinary workload classification and
+Ninja compdb discovery recognize this supported launcher chain and inline options.
+
 An atomic observation.json is the completion marker. It retains the compiler's
 wall-clock placement, monotonic duration, original expanded arguments, actual
 instrumented invocation, selected environment, and post-compilation input

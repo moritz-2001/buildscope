@@ -249,6 +249,311 @@ fn ccache_outcomes_are_build_local_and_survive_archives() {
 }
 
 #[test]
+fn ccache_launcher_reuses_existing_hits_and_profiles_only_misses() {
+    let Some(ccache) = ccache() else { return };
+    for compiler in [clang(), gcc()].into_iter().flatten() {
+        let cached_launcher = format!("{ccache};namespace=buildscope-launcher-test");
+        let fixture = Fixture::new(
+            &compiler,
+            &[
+                &format!("-DCMAKE_CXX_COMPILER_LAUNCHER={cached_launcher}"),
+                "-DCMAKE_NINJA_FORCE_RESPONSE_FILE=ON",
+            ],
+        );
+        let config = fixture.root.path().join("ccache.conf");
+        fs::write(&config, "max_size = 20M\n").unwrap();
+        let stats = fixture.root.path().join("ccache.stats");
+        let build = || {
+            let mut command = ccache_build(&fixture, &config, &stats);
+            command.output().unwrap()
+        };
+        let output = build();
+        assert!(output.status.success(), "{}", diagnostics(&output));
+        assert_cache_results(&stats, 3, 0);
+
+        // Exercise executable paths with spaces, explicit build roots, full detail,
+        // inline ccache settings, response files, and Ninja compdb discovery.
+        let tools = fixture.root.path().join("launcher tools");
+        fs::create_dir(&tools).unwrap();
+        let binary = tools.join("buildscope");
+        fs::copy(env!("CARGO_BIN_EXE_buildscope"), &binary).unwrap();
+        fixture.configure(&compiler, &[
+            &format!("-DCMAKE_CXX_COMPILER_LAUNCHER={};launch;--detail;full;--build-dir;{};--;{cached_launcher}", binary.display(), fixture.build.display()),
+            "-DCMAKE_NINJA_FORCE_RESPONSE_FILE=ON",
+        ]);
+        fs::remove_file(fixture.build.join("compile_commands.json")).unwrap();
+        let project = buildscope::project::discover(&fixture.build, &[]).unwrap();
+        assert!(project.compilers.iter().all(|c| c.family != "unknown"));
+        let invalidate = || {
+            for unit in &project.units {
+                fs::remove_file(&unit.output).unwrap();
+            }
+            fs::write(&stats, "").unwrap();
+        };
+        let pending = fixture.build.join(".buildscope-launcher/pending");
+        let pending_count = || {
+            fs::read_dir(&pending)
+                .map(|entries| entries.count())
+                .unwrap_or(0)
+        };
+
+        invalidate();
+        let output = build();
+        assert!(output.status.success(), "{}", diagnostics(&output));
+        assert_cache_results(&stats, 0, 3);
+        assert_eq!(
+            pending_count(),
+            0,
+            "hits must not create compiler observations"
+        );
+        assert!(collect_launcher(&fixture, "warm-cache").status.success());
+        assert!(fixture.store().list().unwrap().is_empty());
+
+        invalidate();
+        let output = ccache_build(&fixture, &config, &stats)
+            .env("CCACHE_NODIRECT", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", diagnostics(&output));
+        assert_cache_results(&stats, 0, 3);
+        assert_eq!(
+            fs::read_to_string(&stats)
+                .unwrap()
+                .lines()
+                .filter(|line| *line == "preprocessed_cache_hit")
+                .count(),
+            3
+        );
+        assert_eq!(pending_count(), 0);
+
+        append(
+            &fixture.source.join("first.cpp"),
+            "\nint cache_miss_probe() { return 421; }\n",
+        );
+        invalidate();
+        let output = build();
+        assert!(output.status.success(), "{}", diagnostics(&output));
+        assert_cache_results(&stats, 1, 2);
+        assert_eq!(pending_count(), 1);
+        let collected = collect_launcher(&fixture, "mixed-cache");
+        assert!(collected.status.success(), "{}", diagnostics(&collected));
+        let run = fixture.latest();
+        assert_eq!(run.actions.len(), 1);
+        assert_eq!(run.profiles.len(), 1, "{:?}", run.notes);
+        assert_eq!(run.status, "success");
+        let profile = &run.profiles[0];
+        assert!(
+            run.project
+                .units
+                .iter()
+                .find(|u| u.id == profile.unit_id)
+                .unwrap()
+                .source
+                .ends_with("first.cpp")
+        );
+        if profile.family == "clang" {
+            assert!(profile.event_count > 0);
+            assert_eq!(profile.granularity_us, Some(0));
+            assert!(
+                run.headers
+                    .iter()
+                    .any(|h| h.key == "shared.hpp" && h.processing_ms.is_some())
+            );
+        } else {
+            assert_eq!(profile.family, "gcc");
+            assert!(!profile.phases.is_empty());
+        }
+
+        // The trace spool has been collected and deleted. A hit must still avoid
+        // invoking Buildscope, rather than replaying stale traces as fresh work.
+        invalidate();
+        let output = build();
+        assert!(output.status.success(), "{}", diagnostics(&output));
+        assert_cache_results(&stats, 0, 3);
+        assert_eq!(pending_count(), 0);
+        assert!(collect_launcher(&fixture, "all-hits").status.success());
+        assert_eq!(fixture.store().list().unwrap().len(), 1);
+
+        invalidate();
+        let mut record = Command::new(env!("CARGO_BIN_EXE_buildscope"));
+        record
+            .arg("--store")
+            .arg(&fixture.store_path)
+            .args(["record", "--build-dir"])
+            .arg(&fixture.build)
+            .args(["--target", "app", "--jobs", "4"]);
+        ccache_environment(&mut record, &fixture, &config, &stats);
+        let output = record.output().unwrap();
+        assert!(output.status.success(), "{}", diagnostics(&output));
+        let workload = fixture.latest().workload.unwrap();
+        assert_eq!(
+            (workload.compiled, workload.cache_hits, workload.unknown),
+            (0, 3, 0)
+        );
+        assert_eq!(pending_count(), 0);
+
+        // Cache bypass still executes and profiles the native compiler.
+        invalidate();
+        let output = ccache_build(&fixture, &config, &stats)
+            .env("CCACHE_DISABLE", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", diagnostics(&output));
+        assert_eq!(pending_count(), 3);
+        assert!(
+            collect_launcher(&fixture, "cache-disabled")
+                .status
+                .success()
+        );
+        assert_eq!(fixture.latest().profiles.len(), 3);
+
+        append(&fixture.source.join("first.cpp"), "\nnot valid C++;\n");
+        let output = build();
+        assert!(!output.status.success());
+        assert!(diagnostics(&output).contains("first.cpp"));
+        assert_eq!(pending_count(), 1);
+        assert!(
+            collect_launcher(&fixture, "cache-compiler-failure")
+                .status
+                .success()
+        );
+        let failed = fixture.latest();
+        assert_eq!(failed.status, "failed");
+        assert!(failed.actions.iter().any(|action| !action.success));
+    }
+}
+
+#[test]
+fn ccache_launcher_preserves_environment_config_and_inline_prefixes() {
+    let (Some(ccache), Some(compiler)) = (ccache(), clang()) else {
+        return;
+    };
+    for mode in ["environment", "config", "inline"] {
+        let fixture = Fixture::new(&compiler, &[]);
+        let prefix = fixture.root.path().join("compiler-prefix");
+        fs::write(&prefix, "#!/bin/sh\ntest \"$1\" = prefix-argument || exit 91\nshift\ntest -z \"${BUILDSCOPE_CCACHE_CONTEXT+x}\" || exit 92\nprintf 'called\\n' >> \"$PREFIX_LOG\"\nexec \"$@\"\n").unwrap();
+        fs::set_permissions(&prefix, fs::Permissions::from_mode(0o755)).unwrap();
+        let prefix = format!("{} prefix-argument", prefix.display());
+        let config = fixture.root.path().join("ccache.conf");
+        let mut configuration = "max_size = 20M\n".to_owned();
+        if mode == "config" {
+            configuration.push_str(&format!("prefix_command = {prefix}\n"));
+        }
+        fs::write(&config, configuration).unwrap();
+        let inline = if mode == "inline" {
+            format!(";prefix_command={prefix}")
+        } else {
+            String::new()
+        };
+        fixture.configure(
+            &compiler,
+            &[&format!(
+                "-DCMAKE_CXX_COMPILER_LAUNCHER={};launch;--;{ccache}{inline}",
+                env!("CARGO_BIN_EXE_buildscope")
+            )],
+        );
+        let stats = fixture.root.path().join("ccache.stats");
+        let marker = fixture.root.path().join("prefix.log");
+        let build = || {
+            let mut command = ccache_build(&fixture, &config, &stats);
+            command.env("PREFIX_LOG", &marker);
+            if mode == "environment" {
+                command.env("CCACHE_PREFIX", &prefix);
+            }
+            command.output().unwrap()
+        };
+        let output = build();
+        assert!(output.status.success(), "{mode}: {}", diagnostics(&output));
+        assert_cache_results(&stats, 3, 0);
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap().lines().count(),
+            3,
+            "{mode}"
+        );
+        assert!(collect_launcher(&fixture, mode).status.success());
+        let run = fixture.latest();
+        assert_eq!(run.profiles.len(), 3, "{mode}: {:?}", run.notes);
+        assert!(run.profiles.iter().all(|p| p.event_count > 0));
+        let manifest = fs::read_dir(
+            fixture
+                .store()
+                .run_dir(&run.id)
+                .unwrap()
+                .join("invocations"),
+        )
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+        let invocation: Invocation = serde_json::from_slice(&fs::read(manifest).unwrap()).unwrap();
+        assert!(invocation.arguments[0].ends_with("compiler-prefix"));
+        assert_eq!(invocation.arguments[1], "prefix-argument");
+        for unit in &run.project.units {
+            fs::remove_file(&unit.output).unwrap();
+        }
+        fs::write(&stats, "").unwrap();
+        fs::write(&marker, "").unwrap();
+        let output = build();
+        assert!(output.status.success(), "{mode}: {}", diagnostics(&output));
+        assert_cache_results(&stats, 0, 3);
+        assert!(fs::read_to_string(&marker).unwrap().is_empty());
+    }
+}
+
+fn ccache() -> Option<String> {
+    let executable = std::env::var("BUILDSCOPE_TEST_CCACHE").unwrap_or_else(|_| "ccache".into());
+    if Command::new(&executable)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        Some(executable)
+    } else {
+        eprintln!("Skipping real ccache launcher workflow: ccache is unavailable");
+        None
+    }
+}
+
+fn ccache_build(fixture: &Fixture, config: &Path, stats: &Path) -> Command {
+    let mut command = Command::new("cmake");
+    command
+        .arg("--build")
+        .arg(&fixture.build)
+        .args(["--parallel", "4"]);
+    ccache_environment(&mut command, fixture, config, stats);
+    command
+}
+
+fn ccache_environment(command: &mut Command, fixture: &Fixture, config: &Path, stats: &Path) {
+    command
+        .env("CCACHE_DIR", fixture.root.path().join("ccache"))
+        .env("CCACHE_CONFIGPATH", config)
+        .env("CCACHE_STATSLOG", stats)
+        .env_remove("CCACHE_DISABLE")
+        .env_remove("CCACHE_RECACHE")
+        .env_remove("CCACHE_PREFIX")
+        .env_remove("CCACHE_PREFIX_CPP");
+}
+
+fn assert_cache_results(path: &Path, misses: usize, hits: usize) {
+    let stats = fs::read_to_string(path).unwrap();
+    assert_eq!(
+        stats.lines().filter(|line| *line == "cache_miss").count(),
+        misses,
+        "{stats}"
+    );
+    assert_eq!(
+        stats
+            .lines()
+            .filter(|line| matches!(*line, "direct_cache_hit" | "preprocessed_cache_hit"))
+            .count(),
+        hits,
+        "{stats}"
+    );
+}
+
+#[test]
 fn workload_scope_excludes_unrequested_compilation_database_entries() {
     let Some(compiler) = clang() else {
         return;

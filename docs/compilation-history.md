@@ -35,8 +35,9 @@ it does not change cache contents or disable cache reuse. The original log is
 retained and included in full-evidence archives. Logs are matched by source path
 only when the successful unit count matches the record count for that source.
 
-The supported cached command is `ccache COMPILER ...` with a direct native Clang
-or GCC compiler. Custom wrappers, masquerading cache symlinks, nested cache chains,
+The supported cached command is `ccache [KEY=VALUE ...] COMPILER ...` with a direct
+native Clang or GCC compiler, optionally preceded by `buildscope launch ... --`.
+Custom wrappers, masquerading cache symlinks, nested cache chains,
 and sccache remain unknown. Ccache misses with a configured compiler prefix also
 remain unknown because another cache may have served them. Trace artifacts can be
 restored by a cache and do not independently prove compiler execution.

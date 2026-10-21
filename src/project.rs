@@ -90,20 +90,7 @@ pub fn discover(build_dir: &Path, targets: &[String]) -> Result<ProjectSnapshot>
             None => shlex::split(entry.command.as_deref().unwrap_or(""))
                 .context("invalid quoting in compilation database")?,
         };
-        // CMake's exported database excludes launchers, but Ninja compdb includes them.
-        // Strip our launcher syntax before compiler identification and response expansion.
-        if Path::new(arguments.first().map(String::as_str).unwrap_or(""))
-            .file_name()
-            .is_some_and(|name| name == "buildscope")
-        {
-            if arguments.get(1).is_some_and(|arg| arg == "__launch") {
-                arguments.drain(..2);
-            } else if arguments.get(1).is_some_and(|arg| arg == "launch")
-                && let Some(separator) = arguments.iter().position(|arg| arg == "--")
-            {
-                arguments.drain(..=separator);
-            }
-        }
+        strip_launchers(&mut arguments);
         if arguments.iter().any(|arg| arg.starts_with('@')) {
             if let Ok((expanded, _)) =
                 expand_responses(&arguments, Path::new(&directory), &response_files)
@@ -118,6 +105,7 @@ pub fn discover(build_dir: &Path, targets: &[String]) -> Result<ProjectSnapshot>
                     shlex::split(command).context("invalid expanded response-file command")?;
             }
         }
+        strip_launchers(&mut arguments);
         if !["c", "cc", "cpp", "cxx", "C", "mm", "m", "ixx", "cppm"].contains(&extension)
             || !arguments.iter().any(|arg| arg == "-c")
         {
@@ -604,4 +592,12 @@ fn quoted_strings(line: &str) -> Vec<String> {
         }
     }
     strings
+}
+
+// CMake exports native compiler commands, whereas Ninja compdb includes launchers.
+fn strip_launchers(arguments: &mut Vec<String>) {
+    strip_buildscope_launcher(arguments);
+    if let Some(index) = ccache_compiler_index(arguments) {
+        arguments.drain(..index);
+    }
 }

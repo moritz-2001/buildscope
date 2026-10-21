@@ -14,6 +14,9 @@ use std::path::PathBuf;
 /// Parse and execute one CLI request, preserving the exit status of failed builds.
 pub fn run() -> Result<i32> {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|arg| arg == "__ccache_launch") {
+        return launcher::ccache_launch(args[2..].to_vec());
+    }
     if args.get(1).is_some_and(|arg| arg == "__launch") {
         let start = if args.get(2).is_some_and(|arg| arg == "--") {
             3

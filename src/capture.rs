@@ -234,6 +234,19 @@ pub(crate) fn run_compiler(
     compilers: &[CompilerInfo],
     native_diagnostics: bool,
 ) -> Result<Invocation> {
+    run_compiler_with(arguments, root, full, compilers, native_diagnostics, |_| {})
+}
+
+/// Customize execution after instrumentation, keeping cache prefixes out of the
+/// compiler identity and the arguments used to associate observations with units.
+pub(crate) fn run_compiler_with(
+    arguments: Vec<String>,
+    root: &Path,
+    full: bool,
+    compilers: &[CompilerInfo],
+    native_diagnostics: bool,
+    configure: impl FnOnce(&mut Command),
+) -> Result<Invocation> {
     let directory = std::env::current_dir()?;
     let (expanded, response_files) =
         project::expand_responses(&arguments, &directory, &BTreeMap::new())
@@ -284,10 +297,16 @@ pub(crate) fn run_compiler(
             actual.push("-fdiagnostics-format=sarif-stderr".into());
         }
     }
+    let mut command = Command::new(&actual[0]);
+    command.args(&actual[1..]);
+    configure(&mut command);
     let mut invocation = Invocation {
         id: id.clone(),
         directory: path_string(&directory),
-        arguments: actual.clone(),
+        arguments: std::iter::once(command.get_program())
+            .chain(command.get_args())
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect(),
         response_files,
         output,
         family: info.family,
@@ -301,8 +320,6 @@ pub(crate) fn run_compiler(
     };
     let manifest = root.join("invocations").join(format!("{id}.json"));
     write_json(&manifest, &invocation)?;
-    let mut command = Command::new(&actual[0]);
-    command.args(&actual[1..]);
     invocation.started_ms = Some(now_ms());
     let start = Instant::now();
     let status = run_process(

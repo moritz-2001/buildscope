@@ -12,6 +12,46 @@ use std::{
     process::Command,
 };
 
+const CCACHE_CONTEXT: &str = "BUILDSCOPE_CCACHE_CONTEXT";
+
+/// Only the ccache child receives this context; cache hits never invoke the hook.
+#[derive(Serialize, Deserialize)]
+struct CcacheContext {
+    build_dir: PathBuf,
+    full_detail: bool,
+    prefix: Vec<String>,
+}
+
+impl CcacheContext {
+    fn configure(&self, command: &mut Command) {
+        if let Some(executable) = self.prefix.first() {
+            let mut prefixed = Command::new(executable);
+            prefixed
+                .args(&self.prefix[1..])
+                .arg(command.get_program())
+                .args(command.get_args());
+            *command = prefixed;
+        }
+        command.env_remove(CCACHE_CONTEXT);
+    }
+}
+
+/// Internal compiler-prefix entry point. ccache supplies the real compiler here,
+/// after lookup, so profiling flags and trace destinations never enter its key.
+pub(crate) fn ccache_launch(arguments: Vec<String>) -> Result<i32> {
+    let context: CcacheContext = serde_json::from_str(
+        &std::env::var(CCACHE_CONTEXT).context("missing ccache launcher context")?,
+    )?;
+    launch_inner(
+        &LauncherRequest {
+            build_dir: Some(context.build_dir.clone()),
+            full_detail: context.full_detail,
+            arguments,
+        },
+        Some(&context),
+    )
+}
+
 /// Options installed in CMake's C/C++ compiler launcher list.
 pub struct LauncherRequest {
     /// Configured root build directory; None searches the invocation's ancestors.
@@ -25,6 +65,10 @@ pub struct LauncherRequest {
 /// Collect one compiler invocation during an ordinary build, preserving its exit code.
 /// Configure probes outside a finished Ninja tree pass through without recording.
 pub fn launch(request: &LauncherRequest) -> Result<i32> {
+    launch_inner(request, None)
+}
+
+fn launch_inner(request: &LauncherRequest, context: Option<&CcacheContext>) -> Result<i32> {
     ensure!(
         !request.arguments.is_empty(),
         "launch requires -- COMPILER [ARGUMENTS...]"
@@ -44,12 +88,17 @@ pub fn launch(request: &LauncherRequest) -> Result<i32> {
                 .map(Path::to_owned)
         });
     let Some(build) = build.filter(|path| !scratch && path.join("build.ninja").is_file()) else {
-        return forward(&request.arguments);
+        return forward(&request.arguments, context);
     };
     let (arguments, _) =
         project::expand_responses(&request.arguments, &directory, &BTreeMap::new())?;
     if !arguments.iter().any(|arg| arg == "-c") || output_argument(&arguments).is_none() {
-        return forward(&request.arguments);
+        return forward(&request.arguments, context);
+    }
+    if context.is_none()
+        && let Some(index) = ccache_compiler_index(&request.arguments)
+    {
+        return launch_ccache(request, &build, index);
     }
     let spool = build.join(".buildscope-launcher");
     fs::create_dir_all(spool.join("pending"))?;
@@ -70,12 +119,17 @@ pub fn launch(request: &LauncherRequest) -> Result<i32> {
             observed_ms: Some(now_ms()),
             ..Default::default()
         });
-    let invocation = capture::run_compiler(
+    let invocation = capture::run_compiler_with(
         request.arguments.clone(),
         &root,
         request.full_detail,
         std::slice::from_ref(&info),
         true,
+        |command| {
+            if let Some(context) = context {
+                context.configure(command);
+            }
+        },
     )?;
     let source = source_argument(&arguments).map(|path| path_string(resolve(&directory, path)));
     let includes = compiler::parse_includes(
@@ -104,6 +158,59 @@ pub fn launch(request: &LauncherRequest) -> Result<i32> {
     // This is the completion marker: collectors never read a live compiler's artifacts.
     write_json(&root.join("observation.json"), &observation)?;
     Ok(observation.invocation.exit_code.unwrap_or(1))
+}
+
+fn launch_ccache(request: &LauncherRequest, build: &Path, compiler_index: usize) -> Result<i32> {
+    let arguments = &request.arguments;
+    let prefix = ccache_config(
+        arguments,
+        compiler_index,
+        "prefix_command",
+        &std::env::current_dir()?,
+    )?;
+    let context = CcacheContext {
+        build_dir: build.to_owned(),
+        full_detail: request.full_detail,
+        // Match ccache's space-separated prefix syntax, including prefix arguments.
+        prefix: prefix
+            .split(' ')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    };
+    let executable = std::env::current_exe()?;
+    let hook_dir = build
+        .join(".buildscope-launcher/ccache")
+        .join(&digest(executable.as_os_str().as_encoded_bytes())[..16]);
+    fs::create_dir_all(&hook_dir)?;
+    let hook_name = "buildscope-ccache-prefix";
+    let hook = hook_dir.join(hook_name);
+    match std::os::unix::fs::symlink(&executable, &hook) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            ensure!(
+                fs::read_link(&hook)? == executable,
+                "ccache hook points to a different executable"
+            );
+        }
+        Err(error) => return Err(error.into()),
+    }
+    // ccache splits prefix_command on spaces. Resolve a short alias through PATH
+    // so executable and build directory names can contain spaces without quoting.
+    let path = std::env::join_paths(std::iter::once(hook_dir).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))?;
+    let status = Command::new(&arguments[0])
+        .args(&arguments[1..compiler_index])
+        // Last inline setting wins over both earlier settings and CCACHE_PREFIX.
+        .arg(format!("prefix_command={hook_name} __ccache_launch"))
+        .args(&arguments[compiler_index..])
+        .env("PATH", path)
+        .env(CCACHE_CONTEXT, serde_json::to_string(&context)?)
+        .status()?;
+    Ok(status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)))
 }
 
 /// Assemble completed, uncollected launcher observations without executing a build.
@@ -378,8 +485,13 @@ struct Observation {
     invocation: Invocation,
 }
 
-fn forward(arguments: &[String]) -> Result<i32> {
-    let status = Command::new(&arguments[0]).args(&arguments[1..]).status()?;
+fn forward(arguments: &[String], context: Option<&CcacheContext>) -> Result<i32> {
+    let mut command = Command::new(&arguments[0]);
+    command.args(&arguments[1..]);
+    if let Some(context) = context {
+        context.configure(&mut command);
+    }
+    let status = command.status()?;
     Ok(status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)))
