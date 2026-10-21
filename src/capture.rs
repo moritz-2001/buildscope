@@ -4,7 +4,7 @@ pub(crate) use crate::decoder::decode_invocations;
 use crate::{analysis, compiler, model::*, project, store::Store, util::*};
 use anyhow::{Context, Result, ensure};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File},
     io::{BufReader, Read, Write},
     os::unix::process::{CommandExt, ExitStatusExt},
@@ -1034,17 +1034,36 @@ fn display_compiler_diagnostics(text: &str) {
             }
         }
     } else {
+        let include_paths: HashSet<_> = text.lines().filter_map(include_trace_path).collect();
+        let mut include_guard_advice = false;
         for line in text.lines() {
             if line.contains("Time variable") {
                 break;
             }
-            let depth = line.chars().take_while(|c| *c == '.').count();
-            if depth > 0 && line[depth..].starts_with(' ') {
+            if line == "Multiple include guards may be useful for:" {
+                include_guard_advice = true;
+                continue;
+            }
+            // -include/-imacros inputs can appear in GCC's advice without an -H
+            // entry. Recognize existing paths too, but stop at diagnostic text.
+            if include_guard_advice && (include_paths.contains(line) || Path::new(line).exists()) {
+                continue;
+            }
+            include_guard_advice = false;
+            if include_trace_path(line).is_some() {
                 continue;
             }
             eprintln!("{line}");
         }
     }
+}
+
+fn include_trace_path(line: &str) -> Option<&str> {
+    let depth = line.chars().take_while(|c| *c == '.').count();
+    if depth == 0 {
+        return None;
+    }
+    line[depth..].strip_prefix(' ').map(str::trim)
 }
 
 fn exit_code(status: ExitStatus) -> i32 {

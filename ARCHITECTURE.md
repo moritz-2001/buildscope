@@ -158,6 +158,10 @@ wall-clock placement, monotonic duration, original expanded arguments, actual
 instrumented invocation, selected environment, and post-compilation input
 fingerprints. Source fingerprints never get replaced with collection-time
 contents. The public launcher preserves GCC's native diagnostic format.
+Both launchers hide include traces, GCC's include-guard advice and its header
+paths, and timing tables from terminal output. Raw compiler stderr remains
+intact for decoding and inspection; diagnostic lines after include-guard advice
+remain visible.
 
 `collect` acquires a kernel lock shared only by collectors for that build. It
 reads completed observations, queries the current Ninja inventory, and constructs

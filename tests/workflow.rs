@@ -1064,18 +1064,109 @@ exec "$BUILDSCOPE_TEST_NINJA" "$@"
 }
 
 #[test]
+fn launcher_hides_include_guard_advice_and_retains_diagnostics_and_raw_stderr() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("build.ninja"), "").unwrap();
+    fs::write(root.path().join("forced header.hpp"), "").unwrap();
+    let compiler = root.path().join("fake-g++");
+    let stderr = concat!(
+        ". /sdk/system.h\n",
+        ".. ./header with spaces.hpp\n",
+        ". bare.hpp\n",
+        "main.cpp:1: warning: before include-guard advice\n",
+        "Multiple include guards may be useful for:\n",
+        "./header with spaces.hpp\n",
+        "forced header.hpp\n",
+        "/sdk/system.h\n",
+        "bare.hpp\n",
+        "/sdk/system.h:3: error: after include-guard advice\n",
+        "  3 | invalid code\n",
+        "    | ^~~~~~~\n",
+        "compilation terminated.\n",
+        "\nTime variable wall GGC\n",
+        " TOTAL : 0.01 123k\n",
+    );
+    fs::write(
+        &compiler,
+        format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+             --version) echo 'GCC Free Software Foundation'; exit 0 ;;\n\
+             --help) exit 0 ;;\n\
+             -x) exit 1 ;;\n\
+             esac\n\
+             cat >&2 <<'DIAGNOSTICS'\n{stderr}DIAGNOSTICS\nexit 37\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_buildscope"))
+        .current_dir(root.path())
+        .args(["launch", "--build-dir"])
+        .arg(root.path())
+        .arg("--")
+        .arg(&compiler)
+        .args(["-c", "main.cpp", "-o", "main.o"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(37));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        concat!(
+            "main.cpp:1: warning: before include-guard advice\n",
+            "/sdk/system.h:3: error: after include-guard advice\n",
+            "  3 | invalid code\n",
+            "    | ^~~~~~~\n",
+            "compilation terminated.\n\n",
+        )
+    );
+    let observation = fs::read_dir(root.path().join(".buildscope-launcher/pending"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let manifest = fs::read_dir(observation.join("invocations"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let invocation: Invocation = serde_json::from_slice(&fs::read(manifest).unwrap()).unwrap();
+    assert_eq!(
+        fs::read_to_string(observation.join(invocation.stderr)).unwrap(),
+        stderr
+    );
+}
+
+#[test]
 fn public_gcc_launcher_collects_native_timings_and_preserves_diagnostics() {
     let Some(compiler) = gcc() else {
         return;
     };
     let fixture = Fixture::new(&compiler, &[]);
+    fs::write(
+        fixture.source.join("unguarded header.hpp"),
+        "// Intentionally unguarded to exercise GCC's -H advice.\n",
+    )
+    .unwrap();
+    append(
+        &fixture.source.join("second.cpp"),
+        "\n#include \"unguarded header.hpp\"\n#warning visible launcher warning\n",
+    );
     // Exercise inference from Ninja's working directory, without an explicit build root.
     let launcher = format!("{};launch;--", env!("CARGO_BIN_EXE_buildscope"));
     fixture.configure(
         &compiler,
         &[&format!("-DCMAKE_CXX_COMPILER_LAUNCHER={launcher}")],
     );
-    assert!(normal_build(&fixture).status.success());
+    let built = normal_build(&fixture);
+    assert!(built.status.success(), "{}", diagnostics(&built));
+    let output = diagnostics(&built);
+    assert!(output.contains("warning: #warning visible launcher warning"));
+    assert!(!output.contains("Multiple include guards may be useful for:"));
+    assert!(!output.contains("unguarded header.hpp"));
     assert!(collect_launcher(&fixture, "gcc-launcher").status.success());
     let run = fixture.latest();
     assert_eq!(run.profiles.len(), 3, "{:?}", run.notes);
@@ -1090,6 +1181,8 @@ fn public_gcc_launcher_collects_native_timings_and_preserves_diagnostics() {
     assert!(!failed.status.success());
     let output = diagnostics(&failed);
     assert!(output.contains("second.cpp:"));
+    assert!(!output.contains("Multiple include guards may be useful for:"));
+    assert!(!output.contains("unguarded header.hpp"));
     assert!(
         !output.contains("\"$schema\""),
         "public launchers retain native diagnostic text"
