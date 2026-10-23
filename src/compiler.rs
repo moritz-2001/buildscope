@@ -127,6 +127,7 @@ pub fn read_clang_trace(path: &Path, directory: &Path) -> Result<(Vec<TraceEvent
     let mut events = Vec::new();
     let mut phases = Vec::new();
     let mut pending: HashMap<String, Vec<RawEvent>> = HashMap::new();
+    let mut paths = HashMap::new();
     for event in raw.events {
         if let Some(name) = event.name.strip_prefix("Total ") {
             if let Some(duration) = event.dur {
@@ -143,7 +144,7 @@ pub fn read_clang_trace(path: &Path, directory: &Path) -> Result<(Vec<TraceEvent
         match event.ph.as_str() {
             "X" => {
                 if let Some(duration) = event.dur {
-                    events.push(normalize(event, duration, directory));
+                    events.push(normalize(event, duration, directory, &mut paths));
                 }
             }
             "B" | "b" => {
@@ -152,7 +153,7 @@ pub fn read_clang_trace(path: &Path, directory: &Path) -> Result<(Vec<TraceEvent
             "E" | "e" => {
                 if let Some(begin) = pending.get_mut(&event.pair_key()).and_then(Vec::pop) {
                     let duration = (event.ts - begin.ts).max(0.0);
-                    events.push(normalize(begin, duration, directory));
+                    events.push(normalize(begin, duration, directory, &mut paths));
                 }
             }
             _ => {}
@@ -385,7 +386,12 @@ impl RawEvent {
     }
 }
 
-fn normalize(raw: RawEvent, duration: f64, directory: &Path) -> TraceEvent {
+fn normalize(
+    raw: RawEvent,
+    duration: f64,
+    directory: &Path,
+    paths: &mut HashMap<String, String>,
+) -> TraceEvent {
     let thread = raw.thread();
     let mut detail = raw
         .args
@@ -394,7 +400,7 @@ fn normalize(raw: RawEvent, duration: f64, directory: &Path) -> TraceEvent {
         .unwrap_or("")
         .to_owned();
     if raw.name == "Source" && !detail.starts_with('<') {
-        detail = path_string(resolve(directory, &detail));
+        detail = trace_path(directory, &detail, paths);
     }
     TraceEvent {
         id: 0,
@@ -407,11 +413,22 @@ fn normalize(raw: RawEvent, duration: f64, directory: &Path) -> TraceEvent {
             .args
             .get("file")
             .and_then(Value::as_str)
-            .map(|p| path_string(resolve(directory, p))),
+            .map(|path| trace_path(directory, path, paths)),
         line: raw.args.get("line").and_then(Value::as_u64),
         parent: None,
         depth: 0,
     }
+}
+
+// A trace can repeat one header location in millions of scopes. Cache only within
+// this decode so later traces still observe current paths and symlink targets.
+fn trace_path(directory: &Path, path: &str, paths: &mut HashMap<String, String>) -> String {
+    if let Some(resolved) = paths.get(path) {
+        return resolved.clone();
+    }
+    let resolved = path_string(resolve(directory, path));
+    paths.insert(path.into(), resolved.clone());
+    resolved
 }
 
 fn aggregate_symbols(events: &[TraceEvent], include: impl Fn(&str) -> bool) -> Vec<SymbolCost> {

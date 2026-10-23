@@ -38,6 +38,9 @@ pub(crate) fn decode_invocations(
     entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
     capture.profiles.clear();
+    if entries.is_empty() {
+        return Ok(());
+    }
     let mut units_by_output = HashMap::with_capacity(capture.project.units.len());
     for unit in &capture.project.units {
         units_by_output.entry(unit.output.as_str()).or_insert(unit);
@@ -48,6 +51,7 @@ pub(crate) fn decode_invocations(
         .map_or(1, |count| count.get())
         .min(4);
     let run = &capture.id;
+    let mut writer = store.event_writer()?;
     worker_pool::process_ordered(
         &entries,
         workers,
@@ -62,8 +66,8 @@ pub(crate) fn decode_invocations(
                         artifact,
                         source_key,
                     } = *decoded;
-                    // Only this thread replaces per-unit artifacts or opens SQLite writers.
-                    store.save_prepared_events(artifact, &events)?;
+                    // Only this thread replaces artifacts and reuses the SQLite writer.
+                    writer.save(artifact, &events)?;
                     if let Some(&index) = profiles_by_unit.get(&profile.unit_id) {
                         capture.notes.push(format!("Multiple compiler invocations for {source_key}; named detail uses the latest decoded invocation. Raw evidence for all attempts is retained."));
                         capture.profiles[index] = profile;

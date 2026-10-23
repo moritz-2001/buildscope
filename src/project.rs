@@ -4,7 +4,7 @@ use crate::{compiler, model::*, util::*};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     path::Path,
     process::Command,
@@ -335,6 +335,9 @@ pub fn read_dependencies(build: &Path) -> Result<BTreeMap<String, Vec<String>>> 
 /// Decode the documented Ninja deps tool output into output-to-file relations.
 pub fn parse_dependencies(text: &str, build: &Path) -> BTreeMap<String, Vec<String>> {
     let mut result = BTreeMap::new();
+    // Headers recur across compilation units. Resolve each spelling once in this
+    // inventory, retaining canonical symlink identity without caching across reads.
+    let mut resolved = HashMap::new();
     let mut current: Option<String> = None;
     for line in text.lines() {
         if !line.starts_with(' ') && line.contains(": #deps ") {
@@ -350,10 +353,10 @@ pub fn parse_dependencies(text: &str, build: &Path) -> BTreeMap<String, Vec<Stri
         } else if let Some(output) = &current
             && let Some(dependency) = line.strip_prefix("    ")
         {
-            result
-                .entry(output.clone())
-                .or_default()
-                .push(path_string(resolve(build, dependency)));
+            let path = resolved
+                .entry(dependency)
+                .or_insert_with(|| path_string(resolve(build, dependency)));
+            result.entry(output.clone()).or_default().push(path.clone());
         }
     }
     for values in result.values_mut() {

@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::{BufReader, Read, Write},
+    io::{BufRead, BufReader, BufWriter, Read, Write},
     path::{Component, Path, PathBuf},
 };
 
@@ -38,11 +38,73 @@ pub(crate) struct PreparedEvents {
     temporary: PathBuf,
     /// Stable per-unit archive path; only the serial writer replaces this file.
     destination: PathBuf,
+    /// Event JSON rows followed by stack JSON rows, prepared without retaining a
+    /// second in-memory copy of large traces. Removed when publication finishes or fails.
+    rows: PathBuf,
 }
 
 impl Drop for PreparedEvents {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.temporary);
+        let _ = fs::remove_file(&self.rows);
+    }
+}
+
+/// One ordered decoder's SQLite connection, reused across per-unit transactions.
+/// Keeping it open also avoids checkpointing the WAL after every invocation when
+/// no report reader holds another connection.
+pub(crate) struct EventWriter {
+    /// Exclusive writer state; workers prepare files without sharing this connection.
+    connection: Connection,
+}
+
+impl EventWriter {
+    /// Publish prepared rows in invocation order, committing each unit independently.
+    /// Recovery can rebuild an interrupted index from its retained invocation evidence.
+    pub(crate) fn save(&mut self, prepared: PreparedEvents, events: &[TraceEvent]) -> Result<()> {
+        let mut rows = BufReader::new(File::open(&prepared.rows)?);
+        fs::rename(&prepared.temporary, &prepared.destination)?;
+        let run = &prepared.run;
+        let unit = &prepared.unit;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM events WHERE run=?1 AND unit=?2",
+            params![run, unit],
+        )?;
+        {
+            let mut insert = transaction.prepare(
+                "INSERT INTO events(run,unit,idx,name,detail,start,duration,data,file,line)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            )?;
+            let mut json = String::new();
+            for event in events {
+                json.clear();
+                ensure!(
+                    rows.read_line(&mut json)? > 0,
+                    "prepared event row is missing"
+                );
+                insert.execute(params![
+                    run,
+                    unit,
+                    event.id as i64,
+                    event.name,
+                    event.detail,
+                    event.start_us,
+                    event.duration_us,
+                    json.trim_end_matches('\n'),
+                    event.file,
+                    event.line.map(i64::try_from).transpose()?
+                ])?;
+            }
+        }
+        flamegraph::index_prepared_stacks(
+            &transaction,
+            run,
+            unit,
+            rows.lines().map(|line| Ok(line?)),
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 }
 
@@ -341,11 +403,20 @@ impl Store {
 
     /// Index normalized events and keep a compressed copy for independent archives.
     pub fn save_events(&self, run: &str, unit: &str, events: &[TraceEvent]) -> Result<()> {
-        self.save_prepared_events(self.prepare_events(run, unit, events)?, events)
+        let prepared = self.prepare_events(run, unit, events)?;
+        self.event_writer()?.save(prepared, events)
     }
 
-    /// Compress events independently of SQLite and other invocations of the same unit.
-    /// Dropping an unpublished result removes its temporary artifact.
+    /// Open one writer for an ordered batch; each unit still commits independently.
+    pub(crate) fn event_writer(&self) -> Result<EventWriter> {
+        Ok(EventWriter {
+            connection: self.connection()?,
+        })
+    }
+
+    /// Prepare compression, SQL JSON, and stack projections on a decoder worker.
+    /// Row JSON is spooled to disk so large traces do not retain a second serialized
+    /// copy in memory. Dropping an unpublished result removes both temporary files.
     pub(crate) fn prepare_events(
         &self,
         run: &str,
@@ -353,72 +424,51 @@ impl Store {
         events: &[TraceEvent],
     ) -> Result<PreparedEvents> {
         validate_id(unit)?;
-        let directory = self.run_dir(run)?.join("events");
-        fs::create_dir_all(&directory)?;
-        let prepared = PreparedEvents {
-            run: run.into(),
-            unit: unit.into(),
-            temporary: directory.join(format!(".{unit}.{}.tmp", unique_id())),
-            destination: directory.join(format!("{unit}.json.zst")),
-        };
-        let mut encoder = zstd::stream::write::Encoder::new(File::create(&prepared.temporary)?, 3)?;
-        serde_json::to_writer(&mut encoder, events)?;
-        encoder.finish()?;
-        Ok(prepared)
-    }
-
-    /// Publish a prepared event archive and replace its rows on the calling writer thread.
-    /// Archive publication precedes the transaction, as in `save_events`; an interrupted
-    /// index is rebuilt from retained invocation evidence during recovery.
-    pub(crate) fn save_prepared_events(
-        &self,
-        prepared: PreparedEvents,
-        events: &[TraceEvent],
-    ) -> Result<()> {
-        // Check the entire batch before publishing its JSON archive. Otherwise a
-        // later invalid location could reject the index after replacing its backup.
+        // Validate the entire batch before replacing its archive or indexed evidence.
         ensure!(
             events
                 .iter()
                 .all(|event| event.line.is_none_or(|line| line <= i64::MAX as u64)),
             "event line exceeds SQLite integer range"
         );
-        fs::rename(&prepared.temporary, &prepared.destination)?;
-        let run = &prepared.run;
-        let unit = &prepared.unit;
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
-        transaction.execute(
-            "DELETE FROM events WHERE run=?1 AND unit=?2",
-            params![run, unit],
-        )?;
-        {
-            let mut insert = transaction.prepare(
-                "INSERT INTO events(run,unit,idx,name,detail,start,duration,data,file,line)
-                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            )?;
-            for event in events {
-                insert.execute(params![
-                    run,
-                    unit,
-                    event.id as i64,
-                    event.name,
-                    event.detail,
-                    event.start_us,
-                    event.duration_us,
-                    serde_json::to_string(event)?,
-                    event.file,
-                    event
-                        .line
-                        .map(i64::try_from)
-                        .transpose()
-                        .context("event line exceeds SQLite integer range")?
-                ])?;
+        let directory = self.run_dir(run)?.join("events");
+        fs::create_dir_all(&directory)?;
+        let temporary_id = unique_id();
+        let prepared = PreparedEvents {
+            run: run.into(),
+            unit: unit.into(),
+            temporary: directory.join(format!(".{unit}.{temporary_id}.tmp")),
+            destination: directory.join(format!("{unit}.json.zst")),
+            rows: directory.join(format!(".{unit}.{temporary_id}.rows.tmp")),
+        };
+        let mut rows = BufWriter::new(File::create(&prepared.rows)?);
+        let mut encoder = BufWriter::new(zstd::stream::write::Encoder::new(
+            File::create(&prepared.temporary)?,
+            3,
+        )?);
+        encoder.write_all(b"[")?;
+        for (index, event) in events.iter().enumerate() {
+            let json = serde_json::to_string(event)?;
+            if index > 0 {
+                encoder.write_all(b",")?;
             }
+            encoder.write_all(json.as_bytes())?;
+            rows.write_all(json.as_bytes())?;
+            rows.write_all(b"\n")?;
         }
-        flamegraph::index_events(&transaction, run, unit, events)?;
-        transaction.commit()?;
-        Ok(())
+        encoder.write_all(b"]")?;
+        encoder
+            .into_inner()
+            .map_err(|error| error.into_error())?
+            .finish()?;
+        // Stack calculation stays outside SQLite's writer lock. Once serialized,
+        // only the temporary file survives until this invocation is consumed.
+        for stack in crate::compiler_stacks::project(events) {
+            serde_json::to_writer(&mut rows, &stack)?;
+            rows.write_all(b"\n")?;
+        }
+        rows.flush()?;
+        Ok(prepared)
     }
 
     /// Page filtered events through the SQLite index instead of loading an entire trace.

@@ -53,6 +53,24 @@ pub(crate) fn index_events(
     unit: &str,
     events: &[TraceEvent],
 ) -> Result<()> {
+    index_prepared_stacks(
+        connection,
+        run,
+        unit,
+        project(events)
+            .into_iter()
+            .map(|stack| Ok(serde_json::to_string(&stack)?)),
+    )
+}
+
+/// Replace stack rows already calculated and serialized by a decoder worker.
+/// The caller shares its event transaction, so readers see matching evidence.
+pub(crate) fn index_prepared_stacks(
+    connection: &Connection,
+    run: &str,
+    unit: &str,
+    stacks: impl IntoIterator<Item = Result<String>>,
+) -> Result<()> {
     connection.execute(
         "DELETE FROM compiler_stacks WHERE run=?1 AND unit=?2",
         params![run, unit],
@@ -63,8 +81,8 @@ pub(crate) fn index_events(
     )?;
     let mut insert = connection
         .prepare("INSERT INTO compiler_stacks(run,unit,ordinal,data) VALUES(?1,?2,?3,?4)")?;
-    for (i, stack) in project(events).into_iter().enumerate() {
-        insert.execute(params![run, unit, i as i64, serde_json::to_string(&stack)?])?;
+    for (i, stack) in stacks.into_iter().enumerate() {
+        insert.execute(params![run, unit, i as i64, stack?])?;
     }
     Ok(())
 }

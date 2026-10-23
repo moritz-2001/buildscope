@@ -197,6 +197,12 @@ the lock, so it cannot publish a stale checkpoint over a completed capture or le
 partial report rows after interruption. Recovery always reads the manifest,
 independently of those disposable indexes.
 
+Ninja dependency parsing resolves each repeated header spelling once per inventory.
+Clang trace decoding similarly resolves repeated source locations once per trace.
+Both caches are discarded after their read, so later collection observes changed
+symlinks and generated files. Canonical paths, lexical fallbacks, and sorted unique
+dependencies retain their existing meaning.
+
 JSON manifests and imported event streams use buffered readers. Temporary hash
 maps in [collection](src/launcher.rs) and [decoding](src/decoder.rs) index outputs
 and unit IDs while the vectors retain their deterministic order. Output indexes
@@ -211,11 +217,15 @@ That bounds active decoders plus retained event vectors, even when the first tra
 is slow. The bound is by invocation count, not an absolute byte limit; one large
 trace can still need substantial memory.
 
-Workers decode and compress invocation-local traces and prepare normalized events
-in unique temporary files. Only the calling thread publishes per-unit event archives
-and writes SQLite, in sorted manifest order. This preserves profile order and the
+Workers decode and compress invocation-local traces, project compiler stacks, and
+serialize event and stack rows into unique temporary files. Event JSON is serialized
+once for both its compressed archive and a buffered row spool, avoiding a second
+serialized copy of the trace in memory. Only the calling thread publishes per-unit
+event archives and writes SQLite, in sorted manifest order. It reuses one writer
+connection for the batch, with a separate transaction for each unit. This preserves profile order and the
 existing latest-decoded-invocation behavior when several invocations share a unit.
-On failure all workers are joined and unpublished event files are removed. Temporary
+On failure all workers are joined and unpublished event files and row spools are
+removed. Temporary
 files left by a process kill are never used as completed evidence. Raw compression
 publishes its updated invocation manifest before removing the original trace, so
 recovery can read either the old raw trace or its completed compressed replacement.
